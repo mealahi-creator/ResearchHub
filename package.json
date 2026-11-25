@@ -1,0 +1,19 @@
+{
+  "name": "researchhub",
+  "version": "1.0.0",
+  "description": "ResearchHub - Master's & PhD research progress tracker (Express + MongoDB)",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "cookie-parser": "^1.4.7",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.2",
+    "express-rate-limit": "^7.4.1",
+    "jsonwebtoken": "^9.0.2",
+    "mongodb": "^6.10.0",
+    "multer": "^1.4.5-lts.1"
+  }
+}

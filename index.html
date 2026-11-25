@@ -1,0 +1,693 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>ResearchHub</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+<script src="https://unpkg.com/lucide@0.460.0/dist/umd/lucide.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.8.0/mammoth.browser.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<style>
+body{font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif}
+.drop-on{background:#eef2ff!important;border-color:#6366f1!important;border-style:dashed!important}
+input,select,textarea{font-size:16px}
+@media(min-width:640px){input,select,textarea{font-size:14px}}
+@media print{.no-print{display:none!important}}
+</style>
+</head>
+<body class="bg-slate-50 text-slate-900 antialiased min-h-screen">
+<div id="root"><p style="padding:2rem;font-family:sans-serif;color:#64748b">Loading ResearchHub…</p></div>
+<div id="modal-shell" class="fixed inset-0 z-50 hidden items-center justify-center bg-slate-900/50 p-3 sm:p-5">
+  <div class="w-full max-w-2xl rounded-2xl border border-slate-200 bg-white shadow-2xl overflow-hidden max-h-[92vh] flex flex-col">
+    <div class="flex items-center justify-between border-b border-slate-200 px-5 py-3.5 bg-slate-50">
+      <h3 id="modal-title" class="text-sm font-bold text-slate-900">Modal</h3>
+      <button data-act="closeModal" class="rounded-lg p-1.5 text-slate-400 hover:bg-slate-200 hover:text-slate-700" aria-label="Close"><i data-lucide="x" class="h-4 w-4"></i></button>
+    </div>
+    <div id="modal-body" class="p-5 overflow-y-auto flex-1"></div>
+  </div>
+</div>
+<div id="toasts" class="fixed bottom-4 right-4 z-[60] flex flex-col gap-2 max-w-sm"></div>
+<script>
+{
+// ======================= 1. CONSTANTS =======================
+const MASTERS_PHASES=['1. Literature Review','2. Research Proposal','3. Experiments & Build','4. Paper / Thesis Draft','5. Final Defense'];
+const PHD_PHASES=['1. Coursework & Qualifying Exam','2. Systematic Lit Review','3. Proposal & Candidacy','4. Multi-Study Research','5. Publications & Dissertation','6. Pre-Defense & Final Viva'];
+const MS_STATUS=['Not Started','In Progress','Needs Review','Behind Schedule','Completed'];
+const KANBAN=['Backlog','In Progress','Needs Review','Done'];
+const OUTCOMES=['Baseline','Improved','Failed','Final'];
+const RELEVANCE=['High','Medium','Low'];
+const PUB_STATUS=['Idea','Drafting','Supervisor Review','Submitted','Under Review','Revision','Accepted','Published'];
+const REVIEW_TYPES=['Qualifying Exam','Candidacy Defense','Ethics / IRB','Annual Progress Review','Committee Meeting'];
+const REVIEW_OUT=['Passed','Approved','Conditional','Pending','Failed'];
+const FILE_CATS=['Research Paper','Funding Plan','Thesis / Manuscript Draft','Progress Report','Data / Figures','Other'];
+const COLLS=['students','milestones','logs','literature','experiments','publications','reviews','files','comments'];
+const ROLE_LABEL={admin:'Administrator',supervisor:'Supervisor',reviewer:'Reviewer (professor)',student:'Student'};
+const TABS=[['roadmap','Roadmap','map'],['logs','Meeting Logs','notebook-pen'],['experiments','Experiments','flask-conical'],['literature','Literature','book-open'],['publications','Publications','file-text'],['reviews','Reviews & Exams','clipboard-check'],['files','Files','folder'],['feedback','Feedback','message-square']];
+
+// ======================= 2. STATE & SERVER API =======================
+const uid=(p='id')=>`${p}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2,7)}`;
+const todayISO=()=>new Date().toISOString().slice(0,10);
+function emptyData(){const d={people:[]};COLLS.forEach(c=>d[c]=[]);return d}
+const state={
+  me:null,aiEnabled:false,maxUploadMb:25,booted:false,
+  data:emptyData(),view:'overview',sid:null,tab:'roadmap',degree:'All',expView:'kanban',
+  litSearch:'',litRel:'All',sidebarOpen:false,aiBrief:null,aiStudent:{},dragId:null,busy:false,users:null
+};
+try{const u=JSON.parse(localStorage.getItem('researchhub_ui')||'null');if(u)Object.assign(state,{view:u.view||'overview',sid:u.sid||null,tab:u.tab||'roadmap',degree:u.degree||'All',expView:u.expView||'kanban'})}catch{}
+function saveUI(){try{localStorage.setItem('researchhub_ui',JSON.stringify({view:state.view,sid:state.sid,tab:state.tab,degree:state.degree,expView:state.expView}))}catch{}}
+
+async function api(method,url,body,isForm){
+  const opt={method,credentials:'same-origin',headers:{}};
+  if(body!==undefined){if(isForm)opt.body=body;else{opt.headers['Content-Type']='application/json';opt.body=JSON.stringify(body)}}
+  const r=await fetch(url,opt);
+  let j=null;try{j=await r.json()}catch{}
+  if(r.status===401&&!url.startsWith('/api/auth/login')){state.me=null;renderAll();throw new Error('Please sign in again')}
+  if(!r.ok)throw new Error((j&&j.error)||`Request failed (${r.status})`);
+  return j;
+}
+async function reload(){
+  const d=await api('GET','/api/data');
+  const nd=emptyData();Object.keys(nd).forEach(k=>{if(Array.isArray(d[k]))nd[k]=d[k]});state.data=nd;
+  if(state.me.role==='student'){state.view='student';state.sid=state.me.studentId}
+  if(state.sid&&!state.data.students.some(s=>s.id===state.sid)){state.sid=null;state.view=state.view==='users'?'users':'overview'}
+  renderAll();
+}
+// Run a change on the server, then refresh everything
+async function mutate(fn,okMsg){
+  if(state.busy)return;state.busy=true;renderBusy();
+  try{await fn();await reload();if(okMsg)toast(okMsg,'success')}
+  catch(e){toast(e.message||'Something went wrong','error');try{await reload()}catch{}}
+  finally{state.busy=false;renderBusy()}
+}
+function renderBusy(){const el=document.getElementById('busy-dot');if(el)el.className=`h-2 w-2 rounded-full ${state.busy?'bg-amber-400 animate-pulse':'bg-emerald-500'}`}
+const D=()=>state.data;
+const findStu=id=>D().students.find(s=>s.id===id)||null;
+const role=()=>state.me?.role;
+const isAdmin=()=>role()==='admin';
+const isSup=()=>role()==='admin'||role()==='supervisor';
+function canEdit(coll){const r=role();if(r==='admin'||r==='supervisor')return true;if(r==='reviewer')return coll==='comments';if(r==='student')return coll!=='reviews'&&coll!=='students';return false}
+const personName=id=>(D().people.find(p=>p.id===id)||{}).name||'';
+
+// ======================= 3. UTILITIES =======================
+function esc(s){return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')}
+function safeUrl(u){const s=String(u||'').trim();if(!s)return '';const v=/^https?:\/\//i.test(s)?s:'https://'+s;return /^https:\/\//i.test(v)||/^http:\/\//i.test(v)?v:''}
+function link(u,label){const v=safeUrl(u);return v?`<a href="${esc(v)}" target="_blank" rel="noopener" class="inline-flex items-center gap-1 text-indigo-700 hover:underline"><i data-lucide="external-link" class="h-3 w-3"></i>${esc(label)}</a>`:''}
+function cleanDoi(raw){let s=String(raw||'').trim();s=s.replace(/^https?:\/\/(dx\.)?doi\.org\//i,'').replace(/^doi:\s*/i,'').trim();return /^10\.\d{4,9}\/\S+$/i.test(s)?s:''}
+function fmt(iso){if(!iso)return 'TBD';const d=new Date(iso+(String(iso).length===10?'T00:00:00':''));return isNaN(d)?esc(iso):d.toLocaleDateString('en-GB',{day:'numeric',month:'short',year:'numeric'})}
+function daysUntil(iso){if(!iso)return null;const d=new Date(iso+'T00:00:00');if(isNaN(d))return null;return Math.round((d-new Date(todayISO()+'T00:00:00'))/864e5)}
+const phasesFor=t=>t==='PhD'?PHD_PHASES:MASTERS_PHASES;
+function badge(st){
+  const g=['Completed','Done','Published','Accepted','Improved','Passed','Approved'],b=['In Progress','Drafting','Submitted','Under Review','Final'],a=['Needs Review','Supervisor Review','Revision','Pending','Conditional'],r=['Behind Schedule','Failed','Overdue'];
+  const c=g.includes(st)?'bg-emerald-50 text-emerald-700 border-emerald-200':b.includes(st)?'bg-indigo-50 text-indigo-700 border-indigo-200':a.includes(st)?'bg-amber-50 text-amber-800 border-amber-200':r.includes(st)?'bg-rose-50 text-rose-700 border-rose-200':'bg-slate-100 text-slate-600 border-slate-200';
+  return `<span class="inline-flex items-center whitespace-nowrap rounded-full border px-2 py-0.5 text-[11px] font-semibold ${c}">${esc(st||'—')}</span>`}
+function bar(p,cls='bg-indigo-600'){const v=Math.max(0,Math.min(100,Number(p)||0));return `<div class="h-1.5 w-full rounded-full bg-slate-100 overflow-hidden"><div class="h-full rounded-full ${v===100?'bg-emerald-500':cls}" style="width:${v}%"></div></div>`}
+function toast(msg,type='info'){const c=document.getElementById('toasts');const col={success:'bg-emerald-700',warning:'bg-amber-600',error:'bg-rose-700',info:'bg-slate-900'};const el=document.createElement('div');el.className=`rounded-xl px-4 py-2.5 text-xs font-semibold text-white shadow-lg transition-opacity ${col[type]||col.info}`;el.textContent=msg;c.appendChild(el);setTimeout(()=>{el.style.opacity='0';setTimeout(()=>el.remove(),300)},3400)}
+async function copyText(t){try{await navigator.clipboard.writeText(t);toast('Copied to clipboard','success')}catch{try{const ta=document.createElement('textarea');ta.value=t;document.body.appendChild(ta);ta.select();document.execCommand('copy');ta.remove();toast('Copied to clipboard','success')}catch{toast('Copy blocked — select the text and copy it manually.','warning')}}}
+function icons(){try{window.lucide&&window.lucide.createIcons()}catch{}}
+const btn=(act,label,icon,cls='border border-slate-200 bg-white text-slate-700 hover:bg-slate-50',extra='')=>`<button data-act="${act}" ${extra} class="inline-flex min-h-[36px] items-center gap-1.5 rounded-xl px-3 py-2 text-xs font-semibold transition-colors ${cls}">${icon?`<i data-lucide="${icon}" class="h-3.5 w-3.5"></i>`:''}<span>${label}</span></button>`;
+const iconBtn=(act,icon,attrs,title)=>`<button data-act="${act}" ${attrs} title="${title}" aria-label="${title}" class="rounded-lg p-1.5 text-slate-400 hover:bg-slate-100 hover:text-slate-700"><i data-lucide="${icon}" class="h-3.5 w-3.5"></i></button>`;
+
+// ======================= 4. DERIVED DATA =======================
+function bundle(id){
+  const d=D(),student=findStu(id);
+  const by=c=>d[c].filter(x=>x.studentId===id);
+  const milestones=by('milestones'),logs=by('logs').sort((a,b)=>(b.date||'').localeCompare(a.date||'')),literature=by('literature'),experiments=by('experiments'),publications=by('publications'),reviews=by('reviews').sort((a,b)=>(b.date||'').localeCompare(a.date||'')),files=by('files').sort((a,b)=>(b.uploadedAt||'').localeCompare(a.uploadedAt||'')),comments=by('comments');
+  const avg=milestones.length?Math.round(milestones.reduce((s,m)=>s+(Number(m.progress)||0),0)/milestones.length):0;
+  const overdue=milestones.filter(m=>m.status!=='Completed'&&daysUntil(m.endDate)!==null&&daysUntil(m.endDate)<0);
+  const active=milestones.find(m=>m.status==='In Progress'||m.status==='Behind Schedule')||milestones.find(m=>m.status!=='Completed')||milestones[0];
+  return {student,milestones,logs,literature,experiments,publications,reviews,files,comments,avg,
+    done:milestones.filter(m=>m.status==='Completed').length,
+    blockers:logs.filter(l=>l.hasBlocker&&!l.blockerResolved),
+    behind:milestones.filter(m=>m.status==='Behind Schedule'),overdue,
+    reviewMs:milestones.filter(m=>m.status==='Needs Review'),
+    reviewExps:experiments.filter(e=>e.status==='Needs Review'),
+    reviewPubs:publications.filter(p=>p.status==='Supervisor Review'||p.status==='Revision'),
+    published:publications.filter(p=>p.status==='Published'||p.status==='Accepted').length,
+    phase:active?active.phase:phasesFor(student?.track)[0],
+    lastLog:logs[0]||null};
+}
+function alerts(){
+  const out=[];
+  D().students.forEach(s=>{
+    const b=bundle(s.id),push=(sev,tab,title,detail)=>out.push({sev,sid:s.id,name:s.name,track:s.track,tab,title,detail});
+    b.blockers.forEach(l=>push('high','logs',`Active blocker (${fmt(l.date)})`,l.blockers||'Blocker flagged'));
+    b.behind.forEach(m=>push('high','roadmap',`Behind schedule: ${m.title}`,`${m.phase} · due ${fmt(m.endDate)} · ${m.progress||0}%`));
+    b.overdue.filter(m=>m.status!=='Behind Schedule').forEach(m=>push('high','roadmap',`Past due date: ${m.title}`,`Was due ${fmt(m.endDate)} · ${m.progress||0}% · status still "${m.status}"`));
+    b.reviewMs.forEach(m=>push('medium','roadmap',`Milestone needs review: ${m.title}`,`${m.phase} · ${m.progress||0}%`));
+    b.reviewExps.forEach(e=>push('medium','experiments',`Experiment review: ${e.runId||''} ${e.title||''}`,e.metric||e.config||''));
+    b.reviewPubs.forEach(p=>{const dd=daysUntil(p.deadline);push(dd!==null&&dd<=14&&dd>=0?'high':'medium','publications',`Manuscript (${p.status}): ${p.title}`,`${p.venue||'Venue TBD'}${p.deadline?' · deadline '+fmt(p.deadline)+(dd!==null&&dd>=0?` (${dd} days)`:''):''}`)});
+    const lastDays=b.lastLog?-daysUntil(b.lastLog.date):null;
+    const gap=s.cadence==='Weekly'?14:s.cadence==='Monthly'?45:21;
+    if(b.lastLog&&lastDays>gap)push('medium','logs','No meeting log recently',`Last log ${fmt(b.lastLog.date)} (${lastDays} days ago, cadence ${s.cadence||'n/a'})`);
+  });
+  return out.sort((a,b)=>a.sev===b.sev?0:a.sev==='high'?-1:1);
+}
+
+// ======================= 5. SAMPLE LAB =======================
+function sampleLab(){
+  const P=uid('stu'),M=uid('stu');
+  const np=(t,d)=>({id:uid('np'),text:t,done:d});
+  return {
+  students:[
+    {id:P,name:'Nadia Rahman',track:'PhD',degree:'PhD in Computer Science',topic:'Trustworthy Multimodal Foundation Models for Low-Resource Clinical Diagnostics',cadence:'Bi-weekly',coSupervisor:'Dr. S. Patel',startDate:'2024-09-01',targetGraduation:'2028-06-30',nextMeetingDate:'2026-12-03'},
+    {id:M,name:'Daniel Tan',track:'Masters',degree:'M.Eng. Robotics & Autonomy',topic:'Adaptive LiDAR-Camera Sensor Fusion for Autonomous UAVs in Low-Light Warehouses',cadence:'Weekly',coSupervisor:'',startDate:'2025-09-01',targetGraduation:'2027-05-15',nextMeetingDate:'2026-12-01'}],
+  milestones:[
+    [P,0,'Core Coursework & Written Qualifying Exam','2024-09-01','2025-05-15','Completed',100],
+    [P,1,'PRISMA Systematic Review on Clinical Multimodal Calibration','2025-04-01','2025-11-30','Completed',100],
+    [P,2,'Dissertation Proposal & Oral Candidacy Defense','2025-12-01','2026-06-30','Completed',100],
+    [P,3,'Study 2: Cross-Hospital Uncertainty Calibration Benchmark','2026-07-01','2027-03-30','In Progress',65],
+    [P,4,'Journal Manuscript #2 & Dissertation Chapters 3–5','2027-02-01','2027-12-15','Not Started',15],
+    [P,5,'Pre-Defense Seminar & Final Doctoral Viva','2028-01-10','2028-06-30','Not Started',0],
+    [M,0,'Annotated Literature Matrix (30+ SLAM & Fusion Papers)','2025-09-01','2025-12-15','Completed',100],
+    [M,1,'Thesis Proposal Document & Defense','2026-01-05','2026-04-15','Completed',100],
+    [M,2,'Night-Flight UAV Hardware Sync & Benchmark Suite','2026-05-01','2026-11-20','Behind Schedule',72],
+    [M,3,'Conference Paper Draft & Thesis Chapters 1–4','2026-11-25','2027-03-15','In Progress',25],
+    [M,4,'Final Thesis Submission & Defense','2027-03-20','2027-05-15','Not Started',0]
+  ].map(([sid,pi,title,startDate,endDate,status,progress])=>({id:uid('ms'),studentId:sid,phase:(sid===P?PHD_PHASES:MASTERS_PHASES)[pi],title,startDate,endDate,status,progress,deliverableUrl:''})),
+  logs:[
+    {id:uid('log'),studentId:P,date:'2026-11-21',author:'Nadia Rahman',hasBlocker:false,blockerResolved:false,completed:'• Completed external validation on Site-B radiology cohort (N=1,420).\n• Reduced ECE from 0.091 to 0.034 using temperature-scaled conformal gating.\n• Addressed Reviewer #2 comments on IEEE TMI manuscript.',codeUrl:'https://github.com/medai-lab/clinical-calibration',writingUrl:'https://overleaf.com',blockers:'',nextPlan:[np('Finalize response-to-reviewers letter for IEEE TMI revision',true),np('Run subgroup fairness audit across age/scanner models',false)],supervisorFeedback:'Strong calibration gains on Site-B. Review the rebuttal table together on Thursday before resubmission.',agreedActionItems:'Send rebuttal PDF 24h before next meeting.'},
+    {id:uid('log'),studentId:M,date:'2026-11-23',author:'Daniel Tan',hasBlocker:true,blockerResolved:false,completed:'• Deployed FP16 TensorRT uncertainty gating network on Jetson Orin NX (24 FPS).\n• Reduced night-aisle ATE by 31% vs. EKF baseline.',codeUrl:'https://github.com/uav-lab/adaptive-fusion',writingUrl:'',blockers:'38 ms timestamp jitter between LiDAR scan and D435i frames during sharp yaw turns; waiting on PPS trigger cable verification.',nextPlan:[np('Solder & verify PPS hardware sync cable on bench rig',false),np('Re-run 300 m dark warehouse flight loop',false)],supervisorFeedback:'Good catch isolating the 38 ms lag. Pause new ablation runs until hardware sync is under 5 ms.',agreedActionItems:'Bench-verify PPS offset <5 ms by Dec 1.'}],
+  literature:[
+    {id:uid('lit'),studentId:P,title:'On Calibration of Modern Neural Networks',authorsYear:'Guo et al. (2017)',venue:'ICML',doi:'10.48550/arXiv.1706.04599',doiVerified:true,method:'Temperature scaling post-hoc calibration',dataset:'CIFAR-100 / ImageNet',limitations:'Degrades under cross-hospital domain shift.',relevance:'High'},
+    {id:uid('lit'),studentId:M,title:'FAST-LIO2: Fast Direct LiDAR-Inertial Odometry',authorsYear:'Xu et al. (2022)',venue:'IEEE T-RO',doi:'10.1109/TRO.2022.3141876',doiVerified:true,method:'Tightly-coupled iterated Kalman filter with ikd-Tree',dataset:'Urban & UAV datasets',limitations:'Degenerates in featureless corridors.',relevance:'High'},
+    {id:uid('lit'),studentId:M,title:'R3LIVE: Robust Real-time RGB-colored LiDAR-Inertial-Visual Odometry',authorsYear:'Lin & Zhang (2022)',venue:'IEEE ICRA',doi:'10.1109/ICRA46639.2022.9811935',doiVerified:true,method:'Photometric error minimization fused with LiDAR map',dataset:'Handheld outdoor scenes',limitations:'Fragile below 5 lux.',relevance:'High'}],
+  experiments:[
+    [P,'STU-204','Site-B Conformal Calibration','2026-11-18','ViT-B/16 + ClinicalBERT · conformal gating · N=1,420','AUROC 0.942 | ECE 0.034','Needs Review','Improved','Ready for sign-off before adding to Table 3.'],
+    [P,'STU-205','Scanner-Vendor Subgroup Audit','2026-11-24','Stratified GE vs Siemens vs Philips splits','Running…','In Progress','Baseline','Evaluating worst-group calibration gap.'],
+    [M,'EXP-011','Daytime Courtyard EKF Baseline','2026-10-18','Ouster OS0-64 + D435i · daytime','ATE 0.19 m | 28 FPS','Done','Baseline','Matches reference baseline.'],
+    [M,'EXP-014','Attention Gating v2 (Night)','2026-11-22','FP16 TensorRT · 3 lux warehouse','ATE 0.29 m (−31%) | 24 FPS','Needs Review','Improved','Minor yaw drift from 38 ms sync lag.'],
+    [M,'EXP-015','Hardware PPS Trigger Sync Bench','2026-11-25','Flight controller GPIO PPS → D435i','Target <5 ms offset','In Progress','Improved','Wiring trigger pin on bench.'],
+    [M,'EXP-016','Full 300 m Night Flight Validation','2026-12-05','Frozen weights + PPS sync','Target ATE <0.25 m','Backlog','Final','Pending EXP-015.']
+  ].map(([sid,runId,title,date,config,metric,status,outcome,notes])=>({id:uid('exp'),studentId:sid,runId,title,date,config,metric,status,outcome,repoUrl:'',notes})),
+  publications:[
+    {id:uid('pub'),studentId:P,title:'A Systematic Review of Uncertainty Calibration in Clinical Multimodal AI',venue:'Artificial Intelligence in Medicine',tier:'Q1 Journal',authors:'N. Rahman, S. Patel, Supervisor',status:'Published',deadline:'2026-01-15',draftUrl:'',doi:''},
+    {id:uid('pub'),studentId:P,title:'Conformal Cross-Hospital Calibration for Low-Resource Clinical Diagnostics',venue:'IEEE Trans. Medical Imaging',tier:'Q1 Journal',authors:'N. Rahman, Supervisor',status:'Revision',deadline:'2026-12-10',draftUrl:'https://overleaf.com',doi:''},
+    {id:uid('pub'),studentId:M,title:'Uncertainty-Gated LiDAR-Visual Odometry for Dark Warehouse UAVs',venue:'IEEE/RSJ IROS 2027',tier:'Top Conference',authors:'D. Tan, Supervisor',status:'Drafting',deadline:'2027-03-01',draftUrl:'',doi:''}],
+  reviews:[
+    {id:uid('rev'),studentId:P,type:'Qualifying Exam',date:'2025-05-12',outcome:'Passed',notes:'Passed written & oral qualifying exams with distinction.'},
+    {id:uid('rev'),studentId:P,type:'Candidacy Defense',date:'2026-06-18',outcome:'Passed',notes:'Committee approved 3-study plan; recommended external Site-B validation.'},
+    {id:uid('rev'),studentId:P,type:'Ethics / IRB',date:'2025-09-10',outcome:'Approved',notes:'IRB protocol approved for de-identified retrospective imaging.'},
+    {id:uid('rev'),studentId:M,type:'Committee Meeting',date:'2026-04-10',outcome:'Approved',notes:"Master's proposal approved; scope locked to indoor night warehouse benchmark."}],
+  files:[
+    {id:uid('file'),studentId:P,fileName:'IEEE_TMI_Revision_Draft_v3.pdf',category:'Thesis / Manuscript Draft',uploadedBy:'Nadia Rahman',uploadedAt:'2026-11-22',driveUrl:'',notes:'Revised manuscript addressing Reviewer #2 calibration questions.'},
+    {id:uid('file'),studentId:M,fileName:'UAV_Sensor_Budget_Funding_Plan_2026.docx',category:'Funding Plan',uploadedBy:'Daniel Tan',uploadedAt:'2026-11-20',driveUrl:'',notes:'Hardware BOM and travel funding request for IROS 2027.'}]
+  };
+}
+
+
+// ======================= 6. FORMS =======================
+const FORMS={
+  students:{label:'student',fields:[['name','Full name','text',1],['track','Programme','select',['Masters','PhD']],['degree','Degree title','text'],['topic','Research topic','textarea'],['coSupervisor','Co-supervisor (text)','text'],['cadence','Meeting cadence','select',['Weekly','Bi-weekly','Monthly']],['startDate','Start date','date'],['targetGraduation','Target graduation','date'],['nextMeetingDate','Next meeting','date']]},
+  milestones:{label:'milestone',fields:[['phase','Phase','select',s=>phasesFor(s?.track)],['title','Milestone title','text',1],['startDate','Start date','date'],['endDate','Due date','date'],['status','Status','select',MS_STATUS],['progress','Progress (%)','number'],['deliverableUrl','Deliverable link','url']]},
+  logs:{label:'meeting log',fields:[['date','Meeting date','date',1],['author','Written by','text'],['completed','Work completed since last meeting','textarea'],['nextPlan','Plan for next period (one item per line)','lines'],['hasBlocker','There is a blocker','checkbox'],['blockers','Blocker details','textarea'],['codeUrl','Code / repo link','url'],['writingUrl','Writing / Overleaf link','url'],['supervisorFeedback','Supervisor feedback','textarea','sup'],['agreedActionItems','Agreed action items','textarea','sup']]},
+  experiments:{label:'experiment',fields:[['runId','Run ID','text'],['title','Title','text',1],['date','Date','date'],['config','Configuration','text'],['metric','Key metric / result','text'],['status','Board column','select',KANBAN],['outcome','Outcome','select',OUTCOMES],['repoUrl','Repo / log link','url'],['notes','Notes','textarea']]},
+  literature:{label:'paper',fields:[['title','Paper title','text',1],['authorsYear','Authors (year)','text'],['venue','Venue','text'],['doi','DOI','text'],['doiVerified','DOI checked','checkbox'],['method','Method','text'],['dataset','Dataset','text'],['limitations','Limitations / gap','textarea'],['relevance','Relevance','select',RELEVANCE]]},
+  publications:{label:'publication',fields:[['title','Title','text',1],['venue','Target venue','text'],['tier','Tier / quartile','text'],['authors','Authors','text'],['status','Status','select',PUB_STATUS],['deadline','Deadline','date'],['draftUrl','Draft link','url'],['doi','DOI (once published)','text']]},
+  reviews:{label:'review',fields:[['type','Type','select',REVIEW_TYPES],['date','Date','date',1],['outcome','Outcome','select',REVIEW_OUT],['notes','Notes','textarea']]},
+  files:{label:'file link',fields:[['fileName','Name','text',1],['category','Category','select',FILE_CATS],['driveUrl','Link (Google Drive, OneDrive, Overleaf…)','url'],['notes','Notes / what to check','textarea']]}
+};
+const INPUT='w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-slate-900 focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-200';
+function openForm(coll,id,sid){
+  const f=FORMS[coll],item=id?D()[coll].find(x=>x.id===id):null;
+  const stu=coll==='students'?item:findStu(sid||item?.studentId);
+  const v=Object.assign({},item||{});
+  if(!item){if(coll==='logs'){v.date=todayISO();v.author=state.me.name}if(coll==='milestones'){v.progress=0;v.status='Not Started'}}
+  const readOnly=!canEdit(coll);
+  const rows=f.fields.map(([k,lab,type,req])=>{
+    const dis=(req==='sup'&&!isSup())||readOnly?'disabled':'';
+    const val=v[k]??'';let el;
+    if(type==='select'){const opts=typeof req==='function'?req(stu):req;el=`<select name="${k}" ${dis} class="${INPUT}">${opts.map(o=>`<option ${o===val?'selected':''}>${esc(o)}</option>`).join('')}</select>`}
+    else if(type==='textarea')el=`<textarea name="${k}" rows="3" ${dis} class="${INPUT}">${esc(val)}</textarea>`;
+    else if(type==='lines')el=`<textarea name="${k}" rows="3" ${dis} class="${INPUT}">${esc((Array.isArray(val)?val:[]).map(x=>(x.done?'[x] ':'')+x.text).join('\n'))}</textarea><p class="mt-1 text-[11px] text-slate-500">Start a line with [x] to mark it done.</p>`;
+    else if(type==='checkbox')return `<label class="flex items-center gap-2 text-sm font-medium text-slate-700 sm:col-span-2"><input type="checkbox" name="${k}" ${dis} ${val?'checked':''} class="h-4 w-4 rounded border-slate-300 text-indigo-600">${esc(lab)}</label>`;
+    else el=`<input name="${k}" type="${type==='url'?'text':type}" ${dis} ${type==='number'?'min="0" max="100"':''} ${req===1?'required':''} value="${esc(val)}" class="${INPUT}" ${type==='url'?'placeholder="https://…"':''}/>`;
+    const wide=type==='textarea'||type==='lines'||k==='title'||k==='topic'||k==='name';
+    return `<label class="block ${wide?'sm:col-span-2':''}"><span class="mb-1 block text-xs font-semibold text-slate-600">${esc(lab)}${req===1?' *':''}${req==='sup'&&!isSup()?' (supervisor only)':''}</span>${el}</label>`;
+  }).join('');
+  let sup='';
+  if(coll==='students'&&isAdmin()){
+    const sups=D().people.filter(p=>p.role==='supervisor'||p.role==='admin');const cur=item?.supervisorIds||[state.me.id];
+    sup=`<fieldset class="sm:col-span-2"><legend class="mb-1 text-xs font-semibold text-slate-600">Supervisors who can see and edit this student</legend><div class="flex flex-wrap gap-3">${sups.map(p=>`<label class="flex items-center gap-1.5 text-sm"><input type="checkbox" name="sup_${esc(p.id)}" ${cur.includes(p.id)?'checked':''} class="h-4 w-4"/>${esc(p.name)}</label>`).join('')}</div></fieldset>`;
+  }
+  const canDel=item&&canEdit(coll)&&(coll!=='students'||isSup());
+  const del=canDel?`<button type="button" data-act="confirmDelete" data-coll="${coll}" data-id="${item.id}" class="rounded-xl px-3 py-2 text-xs font-semibold text-rose-700 hover:bg-rose-50">Delete</button>`:'<span></span>';
+  openModal((readOnly?'View ':item?'Edit ':'Add ')+f.label+(stu&&coll!=='students'?` · ${stu.name}`:''),
+    `<form id="entity-form" data-coll="${coll}" data-id="${item?.id||''}" data-sid="${stu?.id||''}" class="space-y-4"><div class="grid gap-3 sm:grid-cols-2">${rows}${sup}</div>
+     <div class="flex items-center justify-between gap-2 border-t border-slate-100 pt-4">${del}<div class="flex gap-2"><button type="button" data-act="closeModal" class="rounded-xl border border-slate-200 px-4 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50">${readOnly?'Close':'Cancel'}</button>${readOnly?'':`<button type="submit" class="rounded-xl bg-indigo-600 px-4 py-2 text-xs font-semibold text-white hover:bg-indigo-700">${item?'Save changes':'Add '+f.label}</button>`}</div></div></form>`);
+}
+function submitForm(form){
+  const coll=form.dataset.coll,id=form.dataset.id,sid=form.dataset.sid,f=FORMS[coll];
+  const fd=new FormData(form),obj={};
+  f.fields.forEach(([k,,type,req])=>{
+    if(req==='sup'&&!isSup())return;
+    if(type==='checkbox')obj[k]=form.elements[k].checked;
+    else if(type==='number')obj[k]=Math.max(0,Math.min(100,Number(fd.get(k))||0));
+    else if(type==='lines')obj[k]=String(fd.get(k)||'').split('\n').map(s=>s.trim()).filter(Boolean).map(s=>({id:uid('np'),done:/^\[x\]/i.test(s),text:s.replace(/^\[x\]\s*/i,'')}));
+    else obj[k]=String(fd.get(k)??'').trim();
+  });
+  if(coll==='students'&&isAdmin())obj.supervisorIds=[...form.elements].filter(e=>e.name&&e.name.startsWith('sup_')&&e.checked).map(e=>e.name.slice(4));
+  if(coll==='milestones'&&obj.progress===100)obj.status='Completed';
+  if(coll==='literature'&&obj.doi){if(!cleanDoi(obj.doi))toast('That DOI does not look valid (should start with 10.).','warning');else obj.doi=cleanDoi(obj.doi)}
+  closeModal();
+  mutate(async()=>{
+    if(id)await api('PUT',`/api/${coll}/${id}`,obj);
+    else{const r=await api('POST',`/api/${coll}`,coll==='students'?obj:{...obj,studentId:sid});if(coll==='students'){state.view='student';state.sid=r.id;state.tab='roadmap';saveUI()}}
+  },id?'Saved':'Added');
+}
+const patch=(coll,id,obj)=>mutate(()=>api('PUT',`/api/${coll}/${id}`,obj));
+function removeItem(coll,id){closeModal();mutate(()=>api('DELETE',`/api/${coll}/${id}`),'Deleted')}
+
+// ======================= 7. MODALS =======================
+function openModal(title,html,wide){
+  document.getElementById('modal-title').textContent=title;
+  document.getElementById('modal-body').innerHTML=html;
+  const sh=document.getElementById('modal-shell');sh.firstElementChild.classList.toggle('max-w-4xl',!!wide);sh.firstElementChild.classList.toggle('max-w-2xl',!wide);
+  sh.classList.remove('hidden');sh.classList.add('flex');icons();
+}
+function closeModal(){const sh=document.getElementById('modal-shell');sh.classList.add('hidden');sh.classList.remove('flex');document.getElementById('modal-body').innerHTML=''}
+function confirmBox(msg,act,attrs){openModal('Please confirm',`<p class="text-sm text-slate-700">${msg}</p><div class="mt-5 flex justify-end gap-2"><button data-act="closeModal" class="rounded-xl border border-slate-200 px-4 py-2 text-xs font-semibold text-slate-700">Cancel</button><button data-act="${act}" ${attrs} class="rounded-xl bg-rose-600 px-4 py-2 text-xs font-semibold text-white hover:bg-rose-700">Yes, continue</button></div>`)}
+function backupModal(){
+  const json=JSON.stringify(state.data,null,1);
+  openModal('Export & import',`<div class="space-y-4">
+   <div><p class="text-sm text-slate-700 mb-2">Everything you can see, as JSON (uploaded files themselves stay in the database).</p>
+   <textarea readonly rows="6" class="w-full rounded-xl border border-slate-200 bg-slate-50 p-2 font-mono text-[11px]">${esc(json)}</textarea>
+   ${btn('copyBackup','Copy export','copy','bg-slate-900 text-white hover:bg-slate-800')}</div>
+   ${isSup()?`<div class="border-t border-slate-100 pt-4"><p class="text-sm font-semibold text-slate-800 mb-1">Import</p><p class="text-xs text-slate-500 mb-2">Paste an export (from this app or the earlier claude.ai version). Students are <b>added</b> as new records assigned to you; nothing is overwritten.</p>
+   <textarea id="restore-text" rows="4" class="w-full rounded-xl border border-slate-200 p-2 font-mono text-[11px]" placeholder='{"students":[...]}'></textarea>
+   ${btn('importBackup','Import','download','bg-indigo-600 text-white hover:bg-indigo-700')}</div>`:''}</div>`);
+}
+function passwordModal(force){
+  openModal(force?'Choose a new password':'Change password',`<form id="pw-form" class="space-y-3">${force?'<p class="text-sm text-slate-600">You signed in with a temporary password. Please choose your own (at least 8 characters).</p>':`<label class="block"><span class="mb-1 block text-xs font-semibold text-slate-600">Current password</span><input name="currentPassword" type="password" autocomplete="current-password" class="${INPUT}" required/></label>`}
+   <label class="block"><span class="mb-1 block text-xs font-semibold text-slate-600">New password</span><input name="newPassword" type="password" minlength="8" autocomplete="new-password" class="${INPUT}" required/></label>
+   <label class="block"><span class="mb-1 block text-xs font-semibold text-slate-600">Repeat new password</span><input name="newPassword2" type="password" minlength="8" autocomplete="new-password" class="${INPUT}" required/></label>
+   <div class="flex justify-end"><button type="submit" class="rounded-xl bg-indigo-600 px-4 py-2 text-xs font-semibold text-white">Save password</button></div></form>`);
+}
+
+// ======================= 8. AI (server-side Claude, optional) =======================
+function localBrief(){
+  const al=alerts();const lines=[];
+  lines.push(`${D().students.length} students · ${al.filter(a=>a.sev==='high').length} urgent items · ${al.filter(a=>a.sev!=='high').length} items to review.`);
+  D().students.forEach(s=>{const b=bundle(s.id);const nxt=daysUntil(s.nextMeetingDate);lines.push(`• ${s.name} (${s.track}) — ${b.avg}% overall, now in "${b.phase}". ${b.blockers.length?b.blockers.length+' open blocker(s). ':''}${b.behind.length+b.overdue.length?'Schedule slipping. ':''}${nxt!==null&&nxt>=0?`Next meeting in ${nxt} day(s).`:''}`)});
+  return lines.join('\n');
+}
+async function runAI(kind,sid){
+  if(!state.aiEnabled){toast('AI is not set up on this server yet (see README: ANTHROPIC_API_KEY).','warning');return}
+  if(kind==='lab'){state.aiBrief='Writing briefing…';briefModal()}else{state.aiStudent[sid]='Writing meeting prep…';renderAll()}
+  try{const r=await api('POST','/api/ai/'+kind,{studentId:sid});if(kind==='lab')state.aiBrief=r.text;else state.aiStudent[sid]=r.text}
+  catch(e){if(kind==='lab')state.aiBrief=null;else delete state.aiStudent[sid];toast(e.message,'warning')}
+  kind==='lab'?briefModal():renderAll();
+}
+function briefModal(){
+  openModal('Lab briefing',`<div class="space-y-4">
+   <div><p class="text-xs font-semibold uppercase text-slate-500 mb-1">Quick status</p><pre class="whitespace-pre-wrap font-sans text-sm text-slate-700 rounded-xl bg-slate-50 border border-slate-200 p-3">${esc(localBrief())}</pre></div>
+   <div><div class="flex items-center justify-between mb-1"><p class="text-xs font-semibold uppercase text-slate-500">AI briefing</p>${state.aiEnabled?btn('aiLab',state.aiBrief?'Regenerate':'Write briefing','sparkles','bg-indigo-600 text-white hover:bg-indigo-700'):''}</div>
+   ${state.aiBrief?`<pre class="whitespace-pre-wrap font-sans text-sm text-slate-800 rounded-xl border border-indigo-100 bg-indigo-50/40 p-3">${esc(state.aiBrief)}</pre>${btn('copyBrief','Copy','copy')}`:`<p class="text-sm text-slate-500">${state.aiEnabled?'Claude reads the records you can see and writes a weekly briefing with actions.':'Add an Anthropic API key on the server to turn this on.'}</p>`}</div></div>`,true);
+}
+
+// ======================= 9. UPLOAD PROGRESS (save files → read → review → import) =======================
+const up={files:[],text:'',parsed:null,target:'',category:'Progress Report',busy:false,savedNames:[]};
+async function extractFile(file){
+  const name=file.name.toLowerCase();
+  if(name.endsWith('.docx')&&window.mammoth){const r=await window.mammoth.extractRawText({arrayBuffer:await file.arrayBuffer()});return r.value}
+  if(name.endsWith('.pdf')&&window.pdfjsLib){
+    window.pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+    const pdf=await window.pdfjsLib.getDocument({data:await file.arrayBuffer()}).promise;
+    let out='';for(let i=1;i<=Math.min(pdf.numPages,40);i++){const c=await(await pdf.getPage(i)).getTextContent();out+=c.items.map(x=>x.str).join(' ')+'\n'}return out}
+  if(/\.(xlsx|xls)$/.test(name)&&window.XLSX){const wb=window.XLSX.read(await file.arrayBuffer());return wb.SheetNames.map(n=>`# Sheet ${n}\n`+window.XLSX.utils.sheet_to_csv(wb.Sheets[n])).join('\n')}
+  if(/\.(txt|md|csv|json)$/.test(name))return await file.text();
+  return '';
+}
+function uploadModal(){
+  if(up.parsed)return reviewUpload();
+  const studs=D().students.filter(s=>canEditStudentFiles(s.id));
+  if(!studs.length){toast('No student record you can upload to.','warning');return}
+  openModal('Upload progress',`<div class="space-y-4">
+   <p class="text-sm text-slate-600">Files are <b>saved automatically</b> to the student's Files tab. ${state.aiEnabled?'Claude can then read them and suggest milestones, meeting notes, experiments, papers and publications for you to check.':''}</p>
+   <div class="grid gap-3 sm:grid-cols-2">
+    <label class="block"><span class="mb-1 block text-xs font-semibold text-slate-600">Student</span><select id="up-target" class="${INPUT}">${studs.map(s=>`<option value="${s.id}" ${s.id===(up.target||state.sid)?'selected':''}>${esc(s.name)} (${esc(s.track)})</option>`).join('')}</select></label>
+    <label class="block"><span class="mb-1 block text-xs font-semibold text-slate-600">File category</span><select id="up-cat" class="${INPUT}">${FILE_CATS.map(c=>`<option ${c===up.category?'selected':''}>${c}</option>`).join('')}</select></label>
+   </div>
+   <label id="up-drop" class="flex flex-col items-center justify-center gap-2 rounded-2xl border-2 border-dashed border-slate-300 bg-slate-50 p-6 text-center cursor-pointer hover:border-indigo-400">
+     <i data-lucide="upload-cloud" class="h-7 w-7 text-indigo-600"></i><span class="text-sm font-semibold text-slate-700">Choose files or drop them here</span><span id="up-files" class="text-xs text-slate-500">${up.files.length?esc(up.files.map(f=>f.name).join(', ')):`Any file type, up to ${state.maxUploadMb} MB each`}</span>
+     <input id="up-input" type="file" multiple class="sr-only"/></label>
+   ${state.aiEnabled?`<label class="block"><span class="mb-1 block text-xs font-semibold text-slate-600">…or paste report text for Claude to read</span><textarea id="up-text" rows="4" class="${INPUT}">${esc(up.text)}</textarea></label>
+   <label class="flex items-center gap-2 text-sm"><input id="up-ai" type="checkbox" checked class="h-4 w-4"/> Let Claude read the documents and suggest updates</label>`:''}
+   <div class="flex justify-end gap-2">${btn('closeModal','Cancel','')}${btn('doUpload',up.busy?'Working…':'Save & continue','upload-cloud','bg-indigo-600 text-white hover:bg-indigo-700',up.busy?'disabled':'')}</div></div>`);
+}
+function canEditStudentFiles(sid){return canEdit('files')&&D().students.some(s=>s.id===sid)}
+function setUpFiles(list){up.files=[...up.files,...list];const fl=document.getElementById('up-files');if(fl)fl.textContent=up.files.map(f=>f.name).join(', ')}
+async function doUpload(){
+  up.target=document.getElementById('up-target').value;up.category=document.getElementById('up-cat').value;
+  const ta=document.getElementById('up-text');if(ta)up.text=ta.value;
+  const useAI=state.aiEnabled&&document.getElementById('up-ai')?.checked;
+  if(!up.files.length&&!up.text.trim()){toast('Choose a file or paste some text first.','warning');return}
+  const big=up.files.find(f=>f.size>state.maxUploadMb*1048576);if(big){toast(`${big.name} is larger than ${state.maxUploadMb} MB.`,'error');return}
+  up.busy=true;uploadModal();
+  try{
+    if(up.files.length){const fd=new FormData();fd.append('studentId',up.target);fd.append('category',up.category);up.files.forEach(f=>fd.append('files',f));await api('POST','/api/upload',fd,true);up.savedNames=up.files.map(f=>f.name);toast(`Saved ${up.files.length} file(s)`,'success')}
+    if(useAI){
+      let text=up.text;
+      for(const f of up.files){try{const t=await extractFile(f);if(t)text+=`\n\n=== ${f.name} ===\n`+t}catch{toast('Could not read text from '+f.name,'warning')}}
+      if(text.trim()){const r=await api('POST','/api/ai/extract',{studentId:up.target,text});const p=r.parsed||{};
+        up.parsed={milestones:arr(p.milestones),logs:arr(p.logs),literature:arr(p.literature),experiments:arr(p.experiments),publications:arr(p.publications)};
+        Object.values(up.parsed).forEach(a=>a.forEach(x=>x._keep=true));}
+    }
+  }catch(e){toast(e.message,'error')}
+  up.busy=false;up.files=[];
+  if(up.parsed){reviewUpload()}else{const sid=up.target;resetUp();closeModal();state.view='student';state.sid=sid;state.tab='files';saveUI();await reload()}
+}
+const arr=a=>Array.isArray(a)?a.filter(x=>x&&typeof x==='object'):[];
+function resetUp(){Object.assign(up,{files:[],text:'',parsed:null,savedNames:[],busy:false})}
+function reviewUpload(){
+  const p=up.parsed,sec=[['milestones','Milestones','title'],['logs','Meeting notes','completed'],['experiments','Experiments','title'],['literature','Literature','title'],['publications','Publications','title']];
+  openModal('Check before adding',`<div class="space-y-4">
+   <p class="text-sm text-slate-600">Suggested updates for <b>${esc(findStu(up.target)?.name||'')}</b>. Untick anything you don't want.${up.savedNames.length?' The files themselves are already saved.':''}</p>
+   ${sec.map(([k,lab,f])=>`<div><p class="text-xs font-bold uppercase text-slate-500 mb-1">${lab} (${p[k].length})</p>${p[k].length?p[k].map((x,i)=>`<label class="flex items-start gap-2 rounded-lg px-2 py-1.5 text-sm hover:bg-slate-50"><input type="checkbox" data-up="${k}:${i}" ${x._keep?'checked':''} class="mt-0.5 h-4 w-4"/><span class="min-w-0"><span class="font-medium text-slate-800">${esc(String(x[f]||x.title||'(untitled)').slice(0,140))}</span> <span class="text-xs text-slate-500">${esc([x.status,x.date||x.endDate||x.deadline,x.metric,x.venue].filter(Boolean).join(' · '))}</span></span></label>`).join(''):'<p class="text-xs text-slate-400 px-2">Nothing found</p>'}</div>`).join('')}
+   <div class="flex justify-between gap-2 border-t border-slate-100 pt-4">${btn('discardUpload','Skip suggestions','x')}${btn('commitUpload','Add selected','check','bg-indigo-600 text-white hover:bg-indigo-700')}</div></div>`,true);
+}
+function commitUpload(){
+  const p=up.parsed,sid=up.target,stu=findStu(sid),ph=phasesFor(stu.track);
+  document.querySelectorAll('[data-up]').forEach(cb=>{const [k,i]=cb.dataset.up.split(':');p[k][+i]._keep=cb.checked});
+  const keep=a=>a.filter(x=>x._keep);
+  closeModal();
+  mutate(async()=>{
+    for(const m of keep(p.milestones)){const phase=ph.includes(m.phase)?m.phase:ph[0];const ex=D().milestones.find(x=>x.studentId===sid&&x.phase===phase&&(x.title===phase.replace(/^\d+\.\s*/,'')||x.title===m.title));const v={phase,title:m.title||phase,startDate:m.startDate||'',endDate:m.endDate||'',status:MS_STATUS.includes(m.status)?m.status:'Not Started',progress:Math.max(0,Math.min(100,Number(m.progress)||0))};if(ex)await api('PUT','/api/milestones/'+ex.id,v);else await api('POST','/api/milestones',{...v,studentId:sid})}
+    for(const l of keep(p.logs))await api('POST','/api/logs',{studentId:sid,date:l.date||todayISO(),author:state.me.name,completed:l.completed||'',hasBlocker:!!(l.hasBlocker||l.blockers),blockers:l.blockers||'',nextPlan:(Array.isArray(l.nextPlan)?l.nextPlan:[]).map(t=>({id:uid('np'),text:String(t),done:false}))});
+    for(const e of keep(p.experiments))await api('POST','/api/experiments',{studentId:sid,runId:e.runId||'',title:e.title||'',date:e.date||'',config:e.config||'',metric:e.metric||'',status:KANBAN.includes(e.status)?e.status:'Backlog',outcome:OUTCOMES.includes(e.outcome)?e.outcome:'Baseline',notes:e.notes||''});
+    for(const l of keep(p.literature))await api('POST','/api/literature',{studentId:sid,title:l.title||'',authorsYear:l.authorsYear||'',venue:l.venue||'',doi:cleanDoi(l.doi),doiVerified:false,method:l.method||'',dataset:l.dataset||'',limitations:l.limitations||'',relevance:RELEVANCE.includes(l.relevance)?l.relevance:'Medium'});
+    for(const x of keep(p.publications))await api('POST','/api/publications',{studentId:sid,title:x.title||'',venue:x.venue||'',tier:x.tier||'',authors:x.authors||'',status:PUB_STATUS.includes(x.status)?x.status:'Idea',deadline:x.deadline||''});
+    resetUp();state.view='student';state.sid=sid;saveUI();
+  },'Updates added');
+}
+
+// ======================= 10. USERS (admin) =======================
+async function loadUsers(){try{state.users=await api('GET','/api/users')}catch(e){toast(e.message,'error');state.users=[]}renderAll()}
+function userForm(id){
+  const u=id?(state.users||[]).find(x=>x.id===id):null;const studs=D().students;
+  const assigned=u?(u.role==='supervisor'?studs.filter(s=>(s.supervisorIds||[]).includes(u.id)).map(s=>s.id):u.assignedStudents||[]):[];
+  openModal(u?'Edit account':'Add account',`<form id="user-form" data-id="${u?.id||''}" class="space-y-3">
+   <div class="grid gap-3 sm:grid-cols-2">
+    <label class="block"><span class="mb-1 block text-xs font-semibold text-slate-600">Full name *</span><input name="name" required value="${esc(u?.name||'')}" class="${INPUT}"/></label>
+    <label class="block"><span class="mb-1 block text-xs font-semibold text-slate-600">Email *</span><input name="email" type="email" ${u?'disabled':'required'} value="${esc(u?.email||'')}" class="${INPUT}"/></label>
+    <label class="block sm:col-span-2"><span class="mb-1 block text-xs font-semibold text-slate-600">Role</span><select name="role" id="uf-role" class="${INPUT}" ${u&&u.id===state.me.id?'disabled':''}>${['student','reviewer','supervisor','admin'].map(r=>`<option value="${r}" ${(u?.role||'student')===r?'selected':''}>${ROLE_LABEL[r]}</option>`).join('')}</select></label>
+   </div>
+   <div id="uf-student" class="${(u?.role||'student')==='student'?'':'hidden'}"><label class="block"><span class="mb-1 block text-xs font-semibold text-slate-600">This student account opens the record of</span><select name="studentId" class="${INPUT}"><option value="">— choose student —</option>${studs.map(s=>`<option value="${s.id}" ${u?.studentId===s.id?'selected':''}>${esc(s.name)}</option>`).join('')}</select></label></div>
+   <fieldset id="uf-assign" class="${['reviewer','supervisor'].includes(u?.role)?'':'hidden'}"><legend class="mb-1 text-xs font-semibold text-slate-600">Students this person can see</legend><div class="flex flex-wrap gap-3">${studs.map(s=>`<label class="flex items-center gap-1.5 text-sm"><input type="checkbox" name="as_${s.id}" ${assigned.includes(s.id)?'checked':''} class="h-4 w-4"/>${esc(s.name)}</label>`).join('')||'<span class="text-xs text-slate-400">No students yet</span>'}</div></fieldset>
+   <p class="text-[11px] text-slate-500">Reviewers can read the assigned students' records and leave feedback. Supervisors can edit their assigned students. Students see only their own record.</p>
+   <div class="flex flex-wrap items-center justify-between gap-2 border-t border-slate-100 pt-3"><span class="flex gap-2">${u&&u.id!==state.me.id?`<button type="button" data-act="userReset" data-id="${u.id}" class="rounded-xl px-3 py-2 text-xs font-semibold text-indigo-700 hover:bg-indigo-50">Reset password</button><button type="button" data-act="userToggle" data-id="${u.id}" class="rounded-xl px-3 py-2 text-xs font-semibold text-amber-700 hover:bg-amber-50">${u.disabled?'Enable':'Disable'}</button><button type="button" data-act="userDelete" data-id="${u.id}" class="rounded-xl px-3 py-2 text-xs font-semibold text-rose-700 hover:bg-rose-50">Delete</button>`:''}</span>
+   <span class="flex gap-2"><button type="button" data-act="closeModal" class="rounded-xl border border-slate-200 px-4 py-2 text-xs font-semibold">Cancel</button><button type="submit" class="rounded-xl bg-indigo-600 px-4 py-2 text-xs font-semibold text-white">${u?'Save':'Create account'}</button></span></div></form>`);
+}
+function showTempPassword(email,pw){
+  openModal('Account ready',`<div class="space-y-3 text-sm"><p>Send these sign-in details to <b>${esc(email)}</b>. They will be asked to choose their own password on first sign-in.</p>
+   <div class="rounded-xl border border-slate-200 bg-slate-50 p-3 font-mono text-sm"><div>Address: ${esc(location.origin)}</div><div>Email: ${esc(email)}</div><div>Temporary password: <b>${esc(pw)}</b></div></div>
+   <p class="text-xs text-amber-800">This password is shown only once.</p>
+   <div class="flex justify-end gap-2">${btn('copyCreds','Copy details','copy','bg-slate-900 text-white',`data-email="${esc(email)}" data-pw="${esc(pw)}"`)}${btn('closeModal','Done','')}</div></div>`);
+}
+function submitUser(form){
+  const id=form.dataset.id,fd=new FormData(form);
+  const r=form.elements.role.disabled?state.me.role:fd.get('role');
+  const body={name:String(fd.get('name')||'').trim(),role:r,studentId:String(fd.get('studentId')||''),assignedStudents:[...form.elements].filter(e=>e.name&&e.name.startsWith('as_')&&e.checked).map(e=>e.name.slice(3))};
+  if(!id)body.email=String(fd.get('email')||'').trim();
+  if(r==='student'&&!body.studentId){toast('Choose which student record this account opens.','warning');return}
+  closeModal();
+  mutate(async()=>{
+    if(id)await api('PUT','/api/users/'+id,body);
+    else{const res=await api('POST','/api/users',body);setTimeout(()=>showTempPassword(res.user.email,res.tempPassword),50)}
+    state.users=await api('GET','/api/users');
+  },id?'Account saved':null);
+}
+function renderUsers(){
+  if(!state.users){loadUsers();return '<p class="text-sm text-slate-500">Loading accounts…</p>'}
+  return `<div class="mx-auto max-w-5xl space-y-4"><div class="flex flex-wrap items-end justify-between gap-2"><div><h1 class="text-2xl font-extrabold tracking-tight">People & access</h1><p class="text-sm text-slate-500">Create accounts for students, co-supervisors and professors who review progress.</p></div>${btn('userAdd','Add account','user-plus','bg-indigo-600 text-white hover:bg-indigo-700')}</div>
+  <div class="overflow-x-auto rounded-2xl border border-slate-200 bg-white"><table class="w-full text-sm"><thead class="bg-slate-50 text-left text-[11px] uppercase text-slate-500"><tr><th class="p-3">Name</th><th class="p-3">Role</th><th class="p-3">Can see</th><th class="p-3">Last sign-in</th><th class="p-3"></th></tr></thead><tbody>
+  ${state.users.map(u=>{const sees=u.role==='admin'?'Everything':u.role==='student'?(findStu(u.studentId)?.name||'— not linked —'):u.role==='supervisor'?D().students.filter(s=>(s.supervisorIds||[]).includes(u.id)).map(s=>s.name).join(', ')||'No students':(u.assignedStudents||[]).map(id=>findStu(id)?.name).filter(Boolean).join(', ')||'No students';
+   return `<tr class="border-t border-slate-100 ${u.disabled?'opacity-50':''}"><td class="p-3"><div class="font-semibold">${esc(u.name)}${u.id===state.me.id?' (you)':''}</div><div class="text-[11px] text-slate-500">${esc(u.email)}</div></td><td class="p-3 whitespace-nowrap">${esc(ROLE_LABEL[u.role])}${u.disabled?' · disabled':''}${u.mustChangePassword?'<div class="text-[11px] text-amber-700">Has not signed in yet</div>':''}</td><td class="p-3 text-xs">${esc(sees)}</td><td class="p-3 text-xs whitespace-nowrap">${u.lastLoginAt?fmt(String(u.lastLoginAt).slice(0,10)):'—'}</td><td class="p-3">${iconBtn('userEdit','pencil',`data-id="${u.id}"`,'Edit')}</td></tr>`}).join('')}
+  </tbody></table></div></div>`;
+}
+
+// ======================= 11. LOGIN & SHELL =======================
+function renderLogin(){
+  document.getElementById('root').innerHTML=`<div class="min-h-screen flex items-center justify-center p-4"><form id="login-form" class="w-full max-w-sm rounded-3xl border border-slate-200 bg-white p-7 shadow-sm space-y-4">
+   <div class="flex items-center gap-2.5"><span class="flex h-10 w-10 items-center justify-center rounded-xl bg-indigo-600 text-white"><i data-lucide="graduation-cap" class="h-5 w-5"></i></span><div><div class="text-lg font-extrabold tracking-tight">ResearchHub</div><div class="text-xs text-slate-500">Master's & PhD progress tracker</div></div></div>
+   <label class="block"><span class="mb-1 block text-xs font-semibold text-slate-600">Email</span><input name="email" type="email" autocomplete="username" required class="${INPUT}"/></label>
+   <label class="block"><span class="mb-1 block text-xs font-semibold text-slate-600">Password</span><input name="password" type="password" autocomplete="current-password" required class="${INPUT}"/></label>
+   <button type="submit" class="w-full rounded-xl bg-indigo-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-indigo-700">Sign in</button>
+   <p class="text-center text-[11px] text-slate-500">Accounts are created by your supervisor.</p></form></div>`;
+  icons();
+}
+function renderAll(){
+  if(!state.booted)return;
+  if(!state.me)return renderLogin();
+  const root=document.getElementById('root');
+  const filtered=D().students.filter(s=>state.degree==='All'||s.track===state.degree);
+  const al=role()==='student'?[]:alerts();
+  const stuNav=filtered.map(s=>{const b=bundle(s.id),act=state.view==='student'&&state.sid===s.id,n=al.filter(a=>a.sid===s.id&&a.sev==='high').length;
+    return `<button data-act="openStudent" data-id="${s.id}" class="w-full text-left rounded-xl border px-3 py-2.5 transition-colors ${act?'border-indigo-200 bg-indigo-50':'border-transparent hover:bg-slate-50'}">
+      <div class="flex items-center justify-between gap-2"><span class="truncate text-sm font-semibold text-slate-900">${esc(s.name)}</span><span class="flex items-center gap-1">${n?`<span class="rounded-full bg-rose-600 px-1.5 text-[10px] font-bold text-white">${n}</span>`:''}<span class="rounded-md bg-slate-100 px-1.5 py-0.5 text-[10px] font-bold text-slate-600">${s.track==='PhD'?'PhD':'MSc'}</span></span></div>
+      <div class="mt-0.5 truncate text-[11px] text-slate-500">${esc(b.phase)}</div><div class="mt-1.5 flex items-center gap-2">${bar(b.avg)}<span class="text-[10px] font-semibold text-slate-500">${b.avg}%</span></div></button>`}).join('')||`<p class="px-2 py-6 text-center text-xs text-slate-400">No students yet.</p>`;
+  const degBtn=k=>`<button data-act="setDegree" data-v="${k}" class="rounded-lg py-1.5 ${state.degree===k?'bg-white text-indigo-700 shadow-sm':'text-slate-600 hover:text-slate-900'}">${k==='Masters'?"Master's":k}</button>`;
+  const student=role()==='student';
+  let main;
+  if(student){main=state.sid&&findStu(state.sid)?renderStudent(state.sid):`<div class="mx-auto max-w-md rounded-2xl border border-slate-200 bg-white p-6 text-center text-sm text-slate-600">Your account is not linked to a student record yet. Please ask your supervisor.</div>`}
+  else if(state.view==='users'&&isAdmin())main=renderUsers();
+  else if(state.view==='student'&&state.sid&&findStu(state.sid))main=renderStudent(state.sid);
+  else main=renderOverview(al);
+  root.innerHTML=`
+  <header class="no-print sticky top-0 z-30 border-b border-slate-200 bg-white/95 backdrop-blur">
+   <div class="flex flex-wrap items-center justify-between gap-2 px-3 py-2.5 sm:px-5">
+    <div class="flex items-center gap-2.5">
+     ${student?'':`<button data-act="toggleSidebar" class="lg:hidden rounded-xl border border-slate-200 p-2 text-slate-600" aria-label="Students"><i data-lucide="menu" class="h-4 w-4"></i></button>`}
+     <button data-act="goOverview" class="flex items-center gap-2.5 text-left"><span class="flex h-9 w-9 items-center justify-center rounded-xl bg-indigo-600 text-white"><i data-lucide="graduation-cap" class="h-5 w-5"></i></span>
+      <span><span class="block text-sm font-extrabold tracking-tight sm:text-base">ResearchHub</span><span class="flex items-center gap-1.5 text-[11px] text-slate-500"><span id="busy-dot" class="h-2 w-2 rounded-full ${state.busy?'bg-amber-400 animate-pulse':'bg-emerald-500'}"></span>${esc(state.me.name)} · ${esc(ROLE_LABEL[role()])}</span></span></button>
+    </div>
+    <div class="flex flex-wrap items-center gap-2">
+     ${student?'':btn('openBrief','Lab briefing','sparkles','bg-indigo-600 text-white hover:bg-indigo-700')}
+     ${canEdit('files')&&D().students.length?btn('openUpload','Upload progress','upload-cloud','border border-indigo-200 bg-indigo-50 text-indigo-700 hover:bg-indigo-100'):''}
+     ${isAdmin()?btn('openUsers','People & access','users',state.view==='users'?'bg-slate-900 text-white':'border border-slate-200 bg-white text-slate-700 hover:bg-slate-50'):''}
+     ${btn('openBackup','Export','database')}
+     ${iconBtn('openPassword','key-round','','Change password')}
+     ${iconBtn('logout','log-out','','Sign out')}
+    </div></div></header>
+  <div class="flex min-h-[calc(100vh-61px)]">
+   ${student?'':`<div data-act="toggleSidebar" class="no-print fixed inset-0 z-20 bg-slate-900/40 lg:hidden ${state.sidebarOpen?'':'hidden'}"></div>
+   <aside class="no-print fixed inset-y-0 left-0 z-20 w-72 pt-16 lg:pt-0 lg:sticky lg:top-[61px] lg:h-[calc(100vh-61px)] border-r border-slate-200 bg-white flex flex-col transition-transform ${state.sidebarOpen?'translate-x-0':'-translate-x-full'} lg:translate-x-0">
+    <div class="p-4 border-b border-slate-100 space-y-2">
+     <button data-act="goOverview" class="w-full flex items-center justify-between rounded-xl px-3 py-2.5 text-xs font-bold ${state.view==='overview'?'bg-indigo-50 text-indigo-700':'text-slate-700 hover:bg-slate-50'}"><span class="flex items-center gap-2"><i data-lucide="layout-dashboard" class="h-4 w-4"></i>Lab overview</span>${al.length?`<span class="rounded-full bg-rose-600 px-2 py-0.5 text-[10px] text-white">${al.length}</span>`:''}</button>
+     <div class="grid grid-cols-3 gap-1 rounded-xl bg-slate-100 p-1 text-[11px] font-semibold">${degBtn('All')}${degBtn('PhD')}${degBtn('Masters')}</div>
+    </div>
+    <div class="flex-1 overflow-y-auto p-3 space-y-1">${stuNav}</div>
+    ${isSup()?`<div class="p-3 border-t border-slate-100 space-y-2 bg-slate-50">
+     ${btn('addStudent',"Add Master's / PhD student",'user-plus','w-full justify-center bg-slate-900 text-white hover:bg-slate-800')}
+     ${btn('loadSample','Load sample lab','flask-conical','w-full justify-center border border-slate-200 bg-white text-slate-700 hover:bg-slate-50')}
+    </div>`:''}</aside>`}
+   <main class="flex-1 min-w-0 p-4 sm:p-6 lg:p-8">${main}</main>
+  </div>`;
+  icons();
+}
+function tabFeedback(b){
+  const list=b.comments.slice().sort((x,y)=>String(y.createdAt||'').localeCompare(String(x.createdAt||'')));
+  return `<div class="space-y-3"><p class="text-sm text-slate-500">Feedback from supervisors and reviewing professors. Everyone who can see this student can read it.</p>
+  <form id="comment-form" data-sid="${b.student.id}" class="rounded-2xl border border-slate-200 bg-white p-3 space-y-2"><textarea name="text" rows="3" required placeholder="Write feedback…" class="${INPUT}"></textarea><div class="flex justify-end"><button type="submit" class="rounded-xl bg-indigo-600 px-4 py-2 text-xs font-semibold text-white hover:bg-indigo-700">Post feedback</button></div></form>
+  ${list.length?list.map(c=>`<div class="rounded-2xl border border-slate-200 bg-white p-4"><div class="flex items-start justify-between gap-2"><div><span class="text-sm font-semibold">${esc(c.authorName||'Someone')}</span> <span class="text-[11px] text-slate-500">${esc(ROLE_LABEL[c.authorRole]||'')} · ${c.createdAt?fmt(String(c.createdAt).slice(0,10)):''}</span></div>${c.authorId===state.me.id||isAdmin()?iconBtn('confirmDelete','trash-2',`data-coll="comments" data-id="${c.id}"`,'Delete'):''}</div><p class="mt-1 whitespace-pre-wrap text-sm text-slate-800">${esc(c.text)}</p></div>`).join(''):empty('No feedback yet.')}</div>`;
+}
+function tabFiles(b){
+  return `<div class="space-y-3"><div class="flex flex-wrap justify-between items-center gap-2"><p class="text-sm text-slate-500">Uploaded files are stored in the database. You can also keep links to Drive, OneDrive or Overleaf.</p><div class="flex gap-2">${canEdit('files')?btn('openUpload','Upload files','upload-cloud','bg-indigo-600 text-white hover:bg-indigo-700',`data-sid="${b.student.id}"`)+addBtn('files','link',b.student.id):''}</div></div>
+  ${b.files.length?`<div class="grid gap-3 sm:grid-cols-2">${b.files.map(f=>`<div class="rounded-2xl border border-slate-200 bg-white p-4"><div class="flex items-start justify-between gap-2"><div class="flex min-w-0 items-start gap-2"><i data-lucide="${f.gridId?'file':'link'}" class="mt-0.5 h-4 w-4 flex-none text-indigo-600"></i><div class="min-w-0"><div class="truncate text-sm font-semibold" title="${esc(f.fileName)}">${esc(f.fileName)}</div><div class="text-[11px] text-slate-500">${esc(f.category)} · ${esc(f.uploadedBy||'')} · ${fmt(f.uploadedAt)}${f.size?` · ${(f.size/1048576).toFixed(f.size>1048576?1:2)} MB`:''}</div></div></div>${editBtn('files',f.id)}</div>${f.notes?`<p class="mt-2 text-xs text-slate-600">${esc(f.notes)}</p>`:''}<div class="mt-2 flex flex-wrap gap-3 text-xs">${f.gridId?`<a href="/api/files/${encodeURIComponent(f.id)}/download?inline=1" target="_blank" rel="noopener" class="inline-flex items-center gap-1 text-indigo-700 hover:underline"><i data-lucide="eye" class="h-3 w-3"></i>Open</a><a href="/api/files/${encodeURIComponent(f.id)}/download" class="inline-flex items-center gap-1 text-indigo-700 hover:underline"><i data-lucide="download" class="h-3 w-3"></i>Download</a>`:link(f.driveUrl,'Open link')||'<span class="text-slate-400">No link added</span>'}</div></div>`).join('')}</div>`:empty('No files yet.')}</div>`;
+}
+function stat(label,val,sub,icon,tone='text-indigo-600'){return `<div class="rounded-2xl border border-slate-200 bg-white p-4"><div class="flex items-center justify-between"><span class="text-xs font-semibold text-slate-500">${label}</span><i data-lucide="${icon}" class="h-4 w-4 ${tone}"></i></div><div class="mt-2 text-2xl font-extrabold tracking-tight">${val}</div><div class="text-[11px] text-slate-500">${sub}</div></div>`}
+
+function renderOverview(al){
+  const studs=D().students.filter(s=>state.degree==='All'||s.track===state.degree);
+  if(!D().students.length)return `<div class="mx-auto max-w-xl rounded-3xl border border-slate-200 bg-white p-8 text-center">
+    <span class="mx-auto flex h-12 w-12 items-center justify-center rounded-2xl bg-indigo-50 text-indigo-600"><i data-lucide="graduation-cap" class="h-6 w-6"></i></span>
+    <h1 class="mt-4 text-2xl font-extrabold tracking-tight">Track your Master's and PhD students in one place</h1>
+    <p class="mt-2 text-sm text-slate-600">Each student gets a phase roadmap, meeting logs with blockers, an experiment board, a literature matrix, a publication pipeline and a record of exams and reviews.</p>
+    <div class="mt-6 flex flex-wrap justify-center gap-2">${isSup()?btn('addStudent','Add your first student','user-plus','bg-indigo-600 text-white hover:bg-indigo-700')+btn('loadSample','Try the sample lab','flask-conical'):'<p class="text-sm text-slate-500">No students have been shared with you yet.</p>'}</div></div>`;
+  const bs=studs.map(s=>bundle(s.id));
+  const avg=bs.length?Math.round(bs.reduce((a,b)=>a+b.avg,0)/bs.length):0;
+  const upcoming=D().students.map(s=>({s,d:daysUntil(s.nextMeetingDate)})).filter(x=>x.d!==null&&x.d>=0&&x.d<=14).sort((a,b)=>a.d-b.d);
+  const deadlines=D().publications.map(p=>({p,s:findStu(p.studentId),d:daysUntil(p.deadline)})).filter(x=>x.s&&x.d!==null&&x.d>=0&&x.d<=60&&!['Published','Accepted'].includes(x.p.status)).sort((a,b)=>a.d-b.d);
+  return `<div class="mx-auto max-w-6xl space-y-6">
+   <div class="flex flex-wrap items-end justify-between gap-3"><div><h1 class="text-2xl font-extrabold tracking-tight sm:text-3xl">${al.filter(a=>a.sev==='high').length?`${al.filter(a=>a.sev==='high').length} urgent item${al.filter(a=>a.sev==='high').length>1?'s':''} need your attention`:'Your lab is on track'}</h1><p class="text-sm text-slate-500">${fmt(todayISO())} · ${studs.length} student${studs.length===1?'':'s'} shown</p></div></div>
+   <div class="grid grid-cols-2 gap-3 lg:grid-cols-4">
+    ${stat('Students',studs.length,`${studs.filter(s=>s.track==='PhD').length} PhD · ${studs.filter(s=>s.track!=='PhD').length} Master's`,'users')}
+    ${stat('Average progress',avg+'%','across all milestones','trending-up')}
+    ${stat('Open blockers',bs.reduce((a,b)=>a+b.blockers.length,0),'flagged in meeting logs','alert-triangle','text-rose-600')}
+    ${stat('Accepted / published',bs.reduce((a,b)=>a+b.published,0),`${bs.reduce((a,b)=>a+b.publications.length,0)} in pipeline`,'award','text-emerald-600')}
+   </div>
+   <div class="grid gap-4 lg:grid-cols-3">
+    <section class="lg:col-span-2 rounded-2xl border border-slate-200 bg-white">
+     <div class="flex items-center justify-between border-b border-slate-100 px-4 py-3"><h2 class="text-sm font-bold">Needs attention</h2><span class="text-xs text-slate-500">${al.length} item${al.length===1?'':'s'}</span></div>
+     <div class="divide-y divide-slate-100 max-h-[420px] overflow-y-auto">${al.length?al.map(a=>`<button data-act="openStudent" data-id="${a.sid}" data-tab="${a.tab}" class="flex w-full items-start gap-3 px-4 py-3 text-left hover:bg-slate-50"><span class="mt-1 h-2 w-2 flex-none rounded-full ${a.sev==='high'?'bg-rose-500':'bg-amber-400'}"></span><span class="min-w-0"><span class="block text-sm font-semibold text-slate-900">${esc(a.title)}</span><span class="block text-xs text-slate-500">${esc(a.name)} · ${esc(a.detail)}</span></span></button>`).join(''):`<p class="px-4 py-8 text-center text-sm text-slate-500">Nothing waiting on you.</p>`}</div>
+    </section>
+    <section class="space-y-4">
+     <div class="rounded-2xl border border-slate-200 bg-white p-4"><h2 class="text-sm font-bold mb-2">Meetings (next 14 days)</h2>${upcoming.length?upcoming.map(x=>`<div class="flex justify-between gap-2 py-1 text-sm"><span class="truncate">${esc(x.s.name)}</span><span class="whitespace-nowrap text-xs font-semibold text-slate-600">${x.d===0?'Today':fmt(x.s.nextMeetingDate)}</span></div>`).join(''):'<p class="text-xs text-slate-500">None scheduled. Set a next meeting date on each student profile.</p>'}</div>
+     <div class="rounded-2xl border border-slate-200 bg-white p-4"><h2 class="text-sm font-bold mb-2">Paper deadlines (60 days)</h2>${deadlines.length?deadlines.map(x=>`<div class="py-1"><div class="flex justify-between gap-2 text-sm"><span class="truncate font-medium">${esc(x.p.venue||x.p.title)}</span><span class="whitespace-nowrap text-xs font-semibold ${x.d<=14?'text-rose-600':'text-slate-600'}">${x.d} days</span></div><div class="truncate text-[11px] text-slate-500">${esc(x.s.name)} · ${esc(x.p.status)}</div></div>`).join(''):'<p class="text-xs text-slate-500">No deadlines in the next 60 days.</p>'}</div>
+    </section>
+   </div>
+   <section><h2 class="text-sm font-bold mb-3">Students</h2><div class="grid gap-3 md:grid-cols-2">${bs.map(b=>{const s=b.student,ph=phasesFor(s.track),idx=Math.max(0,ph.indexOf(b.phase));return `<button data-act="openStudent" data-id="${s.id}" class="rounded-2xl border border-slate-200 bg-white p-4 text-left hover:border-indigo-200 hover:shadow-sm transition">
+     <div class="flex items-start justify-between gap-2"><div class="min-w-0"><div class="font-bold text-slate-900">${esc(s.name)}</div><div class="truncate text-xs text-slate-500">${esc(s.degree||s.track)}</div></div><span class="text-lg font-extrabold text-indigo-700">${b.avg}%</span></div>
+     <p class="mt-2 line-clamp-2 text-xs text-slate-600">${esc(s.topic)}</p>
+     <div class="mt-3 flex gap-1">${ph.map((p,i)=>{const m=b.milestones.filter(x=>x.phase===p);const done=m.length&&m.every(x=>x.status==='Completed');const late=m.some(x=>x.status==='Behind Schedule'||b.overdue.includes(x));return `<span title="${esc(p)}" class="h-1.5 flex-1 rounded-full ${done?'bg-emerald-500':late?'bg-rose-500':i===idx?'bg-indigo-500':'bg-slate-200'}"></span>`}).join('')}</div>
+     <div class="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-slate-500"><span>Now: <b class="text-slate-700">${esc(b.phase)}</b></span>${b.blockers.length?`<span class="text-rose-600 font-semibold">${b.blockers.length} blocker</span>`:''}<span>Last log: ${b.lastLog?fmt(b.lastLog.date):'none'}</span></div></button>`}).join('')}</div></section>
+  </div>`;
+}
+
+function renderStudent(id){
+  const b=bundle(id),s=b.student,ph=phasesFor(s.track);
+  const tabs=TABS.map(([k,l,ic])=>{const n=k==='roadmap'?b.milestones.length:k==='logs'?b.logs.length:k==='experiments'?b.experiments.length:k==='literature'?b.literature.length:k==='publications'?b.publications.length:k==='reviews'?b.reviews.length:k==='feedback'?b.comments.length:b.files.length;return `<button data-act="setTab" data-v="${k}" class="inline-flex flex-none items-center gap-1.5 rounded-xl px-3 py-2 text-xs font-semibold ${state.tab===k?'bg-slate-900 text-white':'text-slate-600 hover:bg-slate-100'}"><i data-lucide="${ic}" class="h-3.5 w-3.5"></i>${l}<span class="opacity-60">${n}</span></button>`}).join('');
+  const dg=daysUntil(s.targetGraduation),nm=daysUntil(s.nextMeetingDate);
+  const body={roadmap:tabRoadmap,logs:tabLogs,experiments:tabExperiments,literature:tabLiterature,publications:tabPublications,reviews:tabReviews,files:tabFiles,feedback:tabFeedback}[state.tab]||tabRoadmap;
+  const ai=state.aiStudent[id];
+  return `<div class="mx-auto max-w-6xl space-y-5">
+   <div class="rounded-2xl border border-slate-200 bg-white p-5">
+    <div class="flex flex-wrap items-start justify-between gap-3">
+     <div class="min-w-0"><div class="flex flex-wrap items-center gap-2"><h1 class="text-2xl font-extrabold tracking-tight">${esc(s.name)}</h1><span class="rounded-full bg-indigo-50 border border-indigo-100 px-2 py-0.5 text-[11px] font-bold text-indigo-700">${s.track==='PhD'?'PhD':"Master's"}</span></div>
+      <p class="text-sm text-slate-500">${esc(s.degree)}${s.coSupervisor?' · Co-supervisor: '+esc(s.coSupervisor):''}</p><p class="mt-2 max-w-3xl text-sm text-slate-700">${esc(s.topic)}</p></div>
+     <div class="flex flex-wrap gap-2">${!state.aiEnabled?'':btn('aiStudent','Meeting prep','sparkles','border border-indigo-200 bg-indigo-50 text-indigo-700 hover:bg-indigo-100',`data-id="${id}"`)}${!isSup()?'':btn('editStudent','Edit profile','pencil','border border-slate-200 bg-white text-slate-700 hover:bg-slate-50',`data-id="${id}"`)}</div>
+    </div>
+    <div class="mt-4 grid grid-cols-2 gap-3 sm:grid-cols-4 text-sm">
+     <div><div class="text-[11px] font-semibold text-slate-500">Overall progress</div><div class="font-extrabold text-lg">${b.avg}%</div>${bar(b.avg)}</div>
+     <div><div class="text-[11px] font-semibold text-slate-500">Milestones done</div><div class="font-extrabold text-lg">${b.done}/${b.milestones.length}</div></div>
+     <div><div class="text-[11px] font-semibold text-slate-500">Next meeting</div><div class="font-bold">${fmt(s.nextMeetingDate)}</div><div class="text-[11px] text-slate-500">${s.cadence||''}${nm!==null?` · ${nm<0?Math.abs(nm)+' days ago':nm===0?'today':'in '+nm+' days'}`:''}</div></div>
+     <div><div class="text-[11px] font-semibold text-slate-500">Target graduation</div><div class="font-bold">${fmt(s.targetGraduation)}</div><div class="text-[11px] text-slate-500">${dg!==null?(dg<0?'passed':Math.round(dg/30.4)+' months left'):''}</div></div>
+    </div>
+    <div class="mt-4 flex gap-1">${ph.map(p=>{const m=b.milestones.filter(x=>x.phase===p);const done=m.length&&m.every(x=>x.status==='Completed');const cur=p===b.phase;return `<div class="flex-1 min-w-0"><div class="h-2 rounded-full ${done?'bg-emerald-500':cur?'bg-indigo-500':'bg-slate-200'}"></div><div class="mt-1 hidden truncate text-[10px] sm:block ${cur?'font-bold text-indigo-700':'text-slate-500'}" title="${esc(p)}">${esc(p)}</div></div>`}).join('')}</div>
+    ${ai?`<div class="mt-4 rounded-xl border border-indigo-100 bg-indigo-50/40 p-3"><div class="mb-1 flex items-center justify-between"><span class="text-xs font-bold text-indigo-800">Meeting prep by Claude</span><span class="flex gap-1">${iconBtn('copyStuAI','copy',`data-id="${id}"`,'Copy')}${iconBtn('clearStuAI','x',`data-id="${id}"`,'Close')}</span></div><pre id="ai-stu-text" class="whitespace-pre-wrap font-sans text-sm text-slate-800">${esc(ai)}</pre></div>`:''}
+   </div>
+   <div class="flex gap-1 overflow-x-auto pb-1">${tabs}</div>
+   ${body(b)}
+  </div>`;
+}
+const addBtn=(coll,label,sid)=>!canEdit(coll)?'':btn('add','Add '+label,'plus','bg-indigo-600 text-white hover:bg-indigo-700',`data-coll="${coll}" data-sid="${sid}"`);
+const empty=(t)=>`<div class="rounded-2xl border border-dashed border-slate-300 bg-white p-8 text-center text-sm text-slate-500">${t}</div>`;
+const editBtn=(coll,id)=>iconBtn('edit',canEdit(coll)?'pencil':'eye',`data-coll="${coll}" data-id="${id}"`,canEdit(coll)?'Edit':'View');
+
+function tabRoadmap(b){
+  const ph=phasesFor(b.student.track);
+  return `<div class="space-y-3"><div class="flex justify-between items-center"><p class="text-sm text-slate-500">${b.student.track==='PhD'?'Six':'Five'}-phase ${b.student.track==='PhD'?'doctoral':"master's"} roadmap. Edit due dates and progress as work moves.</p>${addBtn('milestones','milestone',b.student.id)}</div>
+  ${ph.map(p=>{const ms=b.milestones.filter(m=>m.phase===p);return `<section class="rounded-2xl border border-slate-200 bg-white"><div class="border-b border-slate-100 px-4 py-2.5 text-xs font-bold text-slate-600">${esc(p)}</div>
+   ${ms.length?ms.map(m=>{const od=b.overdue.includes(m);return `<div class="flex flex-wrap items-center gap-3 px-4 py-3 border-b border-slate-50 last:border-0"><div class="min-w-0 flex-1 basis-60"><div class="text-sm font-semibold">${esc(m.title)}</div><div class="text-[11px] text-slate-500">${fmt(m.startDate)} → ${fmt(m.endDate)} ${m.deliverableUrl?'· '+link(m.deliverableUrl,'deliverable'):''}</div></div>
+    <div class="w-40 flex items-center gap-2"><input type="range" min="0" max="100" step="5" value="${Number(m.progress)||0}" data-progress="${m.id}" ${canEdit('milestones')?'':'disabled'} class="w-full accent-indigo-600" aria-label="Progress"/><span class="w-9 text-right text-xs font-semibold">${Number(m.progress)||0}%</span></div>
+    <div class="flex items-center gap-1">${od?badge('Overdue'):''}<select data-msstatus="${m.id}" ${canEdit('milestones')?'':'disabled'} class="rounded-lg border border-slate-200 px-2 py-1 text-xs">${MS_STATUS.map(x=>`<option ${x===m.status?'selected':''}>${x}</option>`).join('')}</select>${editBtn('milestones',m.id)}</div></div>`}).join(''):`<p class="px-4 py-3 text-xs text-slate-400">No milestones in this phase.</p>`}</section>`}).join('')}</div>`;
+}
+function tabLogs(b){
+  return `<div class="space-y-3"><div class="flex justify-between items-center gap-2"><p class="text-sm text-slate-500">Students write what they did and what blocks them; you add feedback and agreed actions.</p>${addBtn('logs','meeting log',b.student.id)}</div>
+  ${b.logs.length?b.logs.map(l=>`<article class="rounded-2xl border ${l.hasBlocker&&!l.blockerResolved?'border-rose-200':'border-slate-200'} bg-white p-4 space-y-3">
+   <div class="flex items-start justify-between gap-2"><div><div class="font-bold">${fmt(l.date)}</div><div class="text-[11px] text-slate-500">by ${esc(l.author||'—')}</div></div><div class="flex items-center gap-1">${l.hasBlocker?(l.blockerResolved?badge('Completed'):badge('Behind Schedule')):''}${editBtn('logs',l.id)}</div></div>
+   ${l.completed?`<div><div class="text-[11px] font-bold uppercase text-slate-500">Completed</div><p class="whitespace-pre-wrap text-sm text-slate-700">${esc(l.completed)}</p></div>`:''}
+   ${l.hasBlocker?`<div class="rounded-xl ${l.blockerResolved?'bg-slate-50':'bg-rose-50'} p-3"><div class="flex items-center justify-between gap-2"><span class="text-[11px] font-bold uppercase ${l.blockerResolved?'text-slate-500':'text-rose-700'}">Blocker${l.blockerResolved?' (resolved)':''}</span>${canEdit('logs')?'':'<!--'}<button data-act="toggleBlocker" data-id="${l.id}" class="text-xs font-semibold text-indigo-700 hover:underline">${l.blockerResolved?'Reopen':'Mark resolved'}</button>${canEdit('logs')?'':'-->'}</div><p class="text-sm text-slate-800">${esc(l.blockers)}</p></div>`:''}
+   ${(l.nextPlan||[]).length?`<div><div class="text-[11px] font-bold uppercase text-slate-500 mb-1">Next plan</div>${l.nextPlan.map(n=>`<label class="flex items-start gap-2 text-sm py-0.5"><input type="checkbox" data-plan="${l.id}:${n.id}" ${canEdit('logs')?'':'disabled'} ${n.done?'checked':''} class="mt-0.5 h-4 w-4 rounded text-indigo-600"/><span class="${n.done?'line-through text-slate-400':''}">${esc(n.text)}</span></label>`).join('')}</div>`:''}
+   ${l.supervisorFeedback||l.agreedActionItems?`<div class="rounded-xl bg-indigo-50/50 border border-indigo-100 p-3 text-sm">${l.supervisorFeedback?`<div><span class="text-[11px] font-bold uppercase text-indigo-800">Supervisor feedback</span><p class="text-slate-800">${esc(l.supervisorFeedback)}</p></div>`:''}${l.agreedActionItems?`<div class="mt-2"><span class="text-[11px] font-bold uppercase text-indigo-800">Agreed actions</span><p class="text-slate-800">${esc(l.agreedActionItems)}</p></div>`:''}</div>`:(isSup()?`<button data-act="edit" data-coll="logs" data-id="${l.id}" class="text-xs font-semibold text-indigo-700 hover:underline">+ Add your feedback</button>`:'')}
+   <div class="flex flex-wrap gap-3 text-xs">${link(l.codeUrl,'Code')}${link(l.writingUrl,'Writing')}</div></article>`).join(''):empty('No meeting logs yet. Add one after each supervision meeting.')}</div>`;
+}
+function tabExperiments(b){
+  const t=(v,l)=>`<button data-act="setExpView" data-v="${v}" class="rounded-lg px-3 py-1.5 ${state.expView===v?'bg-white shadow-sm text-indigo-700':'text-slate-600'}">${l}</button>`;
+  const card=e=>`<div draggable="${canEdit('experiments')}" data-drag="${e.id}" class="cursor-grab rounded-xl border border-slate-200 bg-white p-3 shadow-sm active:cursor-grabbing"><div class="flex items-start justify-between gap-1"><span class="font-mono text-[11px] font-bold text-slate-500">${esc(e.runId)}</span>${editBtn('experiments',e.id)}</div><div class="text-sm font-semibold">${esc(e.title)}</div><div class="mt-1 text-[11px] text-slate-500">${esc(e.config)}</div><div class="mt-2 text-xs font-semibold text-slate-800">${esc(e.metric)}</div><div class="mt-2 flex items-center justify-between">${badge(e.outcome)}<span class="text-[10px] text-slate-400">${e.date?fmt(e.date):''}</span></div></div>`;
+  return `<div class="space-y-3"><div class="flex flex-wrap justify-between items-center gap-2"><div class="inline-flex rounded-xl bg-slate-100 p-1 text-xs font-semibold">${t('kanban','Board')}${t('table','Table')}</div>${addBtn('experiments','experiment',b.student.id)}</div>
+  ${!b.experiments.length?empty('No experiments yet.'):state.expView==='kanban'?`${canEdit('experiments')?'<p class="text-[11px] text-slate-500">Drag cards between columns.</p>':''}<div class="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">${KANBAN.map(c=>{const es=b.experiments.filter(e=>(e.status||'Backlog')===c);return `<div data-drop="${c}" class="rounded-2xl border border-slate-200 bg-slate-100/60 p-2 min-h-[140px] space-y-2"><div class="flex justify-between px-1 text-xs font-bold text-slate-600"><span>${c}</span><span>${es.length}</span></div>${es.map(card).join('')}</div>`}).join('')}</div>`
+  :`<div class="overflow-x-auto rounded-2xl border border-slate-200 bg-white"><table class="w-full text-sm"><thead class="bg-slate-50 text-left text-[11px] uppercase text-slate-500"><tr><th class="p-3">Run</th><th class="p-3">Title</th><th class="p-3">Result</th><th class="p-3">Status</th><th class="p-3">Outcome</th><th class="p-3"></th></tr></thead><tbody>${b.experiments.map(e=>`<tr class="border-t border-slate-100"><td class="p-3 font-mono text-xs whitespace-nowrap">${esc(e.runId)}</td><td class="p-3"><div class="font-medium">${esc(e.title)}</div><div class="text-[11px] text-slate-500">${esc(e.config)}</div></td><td class="p-3 text-xs">${esc(e.metric)}</td><td class="p-3">${badge(e.status)}</td><td class="p-3">${badge(e.outcome)}</td><td class="p-3">${editBtn('experiments',e.id)}</td></tr>`).join('')}</tbody></table></div>`}</div>`;
+}
+function tabLiterature(b){
+  const q=state.litSearch.toLowerCase();
+  const list=b.literature.filter(p=>(state.litRel==='All'||p.relevance===state.litRel)&&(!q||[p.title,p.authorsYear,p.venue,p.method,p.dataset,p.limitations].join(' ').toLowerCase().includes(q)));
+  return `<div class="space-y-3"><div class="flex flex-wrap items-center gap-2"><input id="lit-search" value="${esc(state.litSearch)}" placeholder="Search papers, methods, datasets…" class="flex-1 min-w-[200px] rounded-xl border border-slate-200 px-3 py-2"/><select id="lit-rel" class="rounded-xl border border-slate-200 px-3 py-2 text-sm">${['All',...RELEVANCE].map(r=>`<option ${r===state.litRel?'selected':''}>${r}</option>`).join('')}</select>${addBtn('literature','paper',b.student.id)}</div>
+  <p class="text-[11px] text-slate-500">${b.literature.length} papers · ${b.literature.filter(p=>p.doi&&p.doiVerified).length} with checked DOI</p>
+  ${list.length?`<div class="overflow-x-auto rounded-2xl border border-slate-200 bg-white"><table class="w-full text-sm"><thead class="bg-slate-50 text-left text-[11px] uppercase text-slate-500"><tr><th class="p-3">Paper</th><th class="p-3">Method / data</th><th class="p-3">Gap</th><th class="p-3">Relevance</th><th class="p-3"></th></tr></thead><tbody>${list.map(p=>{const d=cleanDoi(p.doi);return `<tr class="border-t border-slate-100 align-top"><td class="p-3 min-w-[220px]"><div class="font-medium">${esc(p.title)}</div><div class="text-[11px] text-slate-500">${esc(p.authorsYear)} · ${esc(p.venue)}</div>${d?`<div class="mt-1 text-[11px]">${link('https://doi.org/'+d,d)} ${p.doiVerified?'<span class="text-emerald-700">✓</span>':''}</div>`:p.doi?'<div class="text-[11px] text-rose-600">Invalid DOI</div>':''}</td><td class="p-3 text-xs min-w-[160px]">${esc(p.method)}<div class="text-slate-500">${esc(p.dataset)}</div></td><td class="p-3 text-xs min-w-[160px]">${esc(p.limitations)}</td><td class="p-3">${badge(p.relevance==='High'?'In Progress':p.relevance==='Medium'?'Pending':'')}<span class="sr-only">${esc(p.relevance)}</span><div class="text-[11px] mt-1">${esc(p.relevance)}</div></td><td class="p-3">${editBtn('literature',p.id)}</td></tr>`}).join('')}</tbody></table></div>`:empty(b.literature.length?'No papers match.':'No papers yet. Build the literature matrix here.')}</div>`;
+}
+function tabPublications(b){
+  return `<div class="space-y-3"><div class="flex justify-between items-center"><p class="text-sm text-slate-500">From idea to published.</p>${addBtn('publications','publication',b.student.id)}</div>
+  ${b.publications.length?b.publications.map(p=>{const i=PUB_STATUS.indexOf(p.status),dd=daysUntil(p.deadline);return `<div class="rounded-2xl border border-slate-200 bg-white p-4"><div class="flex items-start justify-between gap-2"><div class="min-w-0"><div class="font-semibold">${esc(p.title)}</div><div class="text-xs text-slate-500">${esc(p.venue)}${p.tier?' · '+esc(p.tier):''} · ${esc(p.authors)}</div></div><div class="flex items-center gap-1">${badge(p.status)}${editBtn('publications',p.id)}</div></div>
+   <div class="mt-3 flex gap-1">${PUB_STATUS.map((s,j)=>`<span title="${s}" class="h-1.5 flex-1 rounded-full ${j<=i?'bg-indigo-500':'bg-slate-200'}"></span>`).join('')}</div>
+   <div class="mt-2 flex flex-wrap gap-3 text-[11px] text-slate-500">${p.deadline?`<span class="${dd!==null&&dd>=0&&dd<=14?'font-bold text-rose-600':''}">Deadline ${fmt(p.deadline)}${dd!==null&&dd>=0?` (${dd} days)`:''}</span>`:''}${link(p.draftUrl,'Draft')}${cleanDoi(p.doi)?link('https://doi.org/'+cleanDoi(p.doi),'DOI'):''}</div>
+   <div class="mt-2"><select data-pubstatus="${p.id}" ${canEdit('publications')?'':'disabled'} class="rounded-lg border border-slate-200 px-2 py-1 text-xs">${PUB_STATUS.map(x=>`<option ${x===p.status?'selected':''}>${x}</option>`).join('')}</select></div></div>`}).join(''):empty('No publications yet.')}</div>`;
+}
+function tabReviews(b){
+  return `<div class="space-y-3"><div class="flex justify-between items-center"><p class="text-sm text-slate-500">Qualifying exams, candidacy, ethics approvals, annual reviews and committee meetings.</p>${addBtn('reviews','review',b.student.id)}</div>
+  ${b.reviews.length?`<ol class="relative border-l-2 border-slate-200 ml-2 space-y-4">${b.reviews.map(r=>`<li class="ml-4"><span class="absolute -left-[7px] mt-1.5 h-3 w-3 rounded-full border-2 border-white ${['Passed','Approved'].includes(r.outcome)?'bg-emerald-500':r.outcome==='Failed'?'bg-rose-500':'bg-amber-400'}"></span><div class="rounded-2xl border border-slate-200 bg-white p-4"><div class="flex justify-between gap-2"><div><div class="font-semibold">${esc(r.type)}</div><div class="text-[11px] text-slate-500">${fmt(r.date)}</div></div><div class="flex items-center gap-1">${badge(r.outcome)}${editBtn('reviews',r.id)}</div></div>${r.notes?`<p class="mt-2 text-sm text-slate-700">${esc(r.notes)}</p>`:''}</div></li>`).join('')}</ol>`:empty('No reviews or exams recorded.')}</div>`;
+}
+
+// ======================= 12. EVENTS =======================
+const ACT={
+  closeModal,goOverview:()=>{if(role()==='student')return;state.view='overview';state.sidebarOpen=false;saveUI();renderAll()},
+  toggleSidebar:()=>{state.sidebarOpen=!state.sidebarOpen;renderAll()},
+  setDegree:d=>{state.degree=d.v;saveUI();renderAll()},
+  openStudent:d=>{state.view='student';state.sid=d.id;if(d.tab)state.tab=d.tab;state.sidebarOpen=false;saveUI();renderAll();window.scrollTo(0,0)},
+  setTab:d=>{state.tab=d.v;saveUI();renderAll()},
+  setExpView:d=>{state.expView=d.v;saveUI();renderAll()},
+  addStudent:()=>openForm('students'),editStudent:d=>openForm('students',d.id),
+  add:d=>openForm(d.coll,null,d.sid),edit:d=>openForm(d.coll,d.id),
+  confirmDelete:d=>confirmBox(d.coll==='students'?'Delete this student and <b>all</b> their milestones, logs, experiments, feedback and uploaded files?':'Delete this item?','doDelete',`data-coll="${d.coll}" data-id="${d.id}"`),
+  doDelete:d=>removeItem(d.coll,d.id),
+  loadSample:()=>confirmBox('Add a sample lab (1 PhD and 1 Master\'s student with example data)? You can delete them afterwards.','doSample',''),
+  doSample:()=>{closeModal();mutate(()=>api('POST','/api/import',sampleLab()),'Sample lab added')},
+  toggleBlocker:d=>{const l=D().logs.find(x=>x.id===d.id);if(l)patch('logs',l.id,{blockerResolved:!l.blockerResolved})},
+  openBrief:briefModal,aiLab:()=>runAI('lab'),aiStudent:d=>runAI('student',d.id),
+  copyBrief:()=>copyText(state.aiBrief||''),copyStuAI:d=>copyText(state.aiStudent[d.id]||''),clearStuAI:d=>{delete state.aiStudent[d.id];renderAll()},
+  openBackup:backupModal,copyBackup:()=>copyText(JSON.stringify(state.data)),
+  importBackup:()=>{let p;try{p=JSON.parse(document.getElementById('restore-text').value);if(p.data&&p.data.students)p=p.data;if(!Array.isArray(p.students)||!p.students.length)throw 0}catch{toast('That is not a valid ResearchHub export.','error');return}
+    closeModal();mutate(()=>api('POST','/api/import',p),`Imported ${p.students.length} student(s)`)},
+  openUpload:d=>{if(d&&d.sid)up.target=d.sid;uploadModal()},doUpload:()=>doUpload(),
+  discardUpload:()=>{const sid=up.target;resetUp();closeModal();state.view='student';state.sid=sid;state.tab='files';saveUI();reload()},commitUpload,
+  openUsers:()=>{state.view='users';state.users=null;saveUI();renderAll()},
+  userAdd:()=>userForm(),userEdit:d=>userForm(d.id),
+  userReset:d=>{closeModal();mutate(async()=>{const r=await api('PUT','/api/users/'+d.id,{resetPassword:true});const u=state.users.find(x=>x.id===d.id);state.users=await api('GET','/api/users');setTimeout(()=>showTempPassword(u.email,r.tempPassword),50)})},
+  userToggle:d=>{const u=state.users.find(x=>x.id===d.id);closeModal();mutate(async()=>{await api('PUT','/api/users/'+d.id,{disabled:!u.disabled});state.users=await api('GET','/api/users')},u.disabled?'Account enabled':'Account disabled')},
+  userDelete:d=>confirmBox('Delete this account? Their records and feedback stay.','userDeleteYes',`data-id="${d.id}"`),
+  userDeleteYes:d=>{closeModal();mutate(async()=>{await api('DELETE','/api/users/'+d.id);state.users=await api('GET','/api/users')},'Account deleted')},
+  copyCreds:d=>copyText(`ResearchHub sign-in\nAddress: ${location.origin}\nEmail: ${d.email}\nTemporary password: ${d.pw}`),
+  openPassword:()=>passwordModal(false),
+  logout:async()=>{try{await api('POST','/api/auth/logout')}catch{}state.me=null;state.data=emptyData();state.users=null;renderAll()}
+};
+document.addEventListener('click',e=>{const el=e.target.closest('[data-act]');if(!el||el.disabled)return;const f=ACT[el.dataset.act];if(f){e.preventDefault();f(el.dataset)}});
+document.getElementById('modal-shell').addEventListener('click',e=>{if(e.target.id==='modal-shell'&&!state.me?.mustChangePassword)closeModal()});
+document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!state.me?.mustChangePassword)closeModal()});
+document.addEventListener('submit',async e=>{
+  const t=e.target;
+  if(t.id==='entity-form'){e.preventDefault();submitForm(t)}
+  else if(t.id==='user-form'){e.preventDefault();submitUser(t)}
+  else if(t.id==='comment-form'){e.preventDefault();const text=t.elements.text.value.trim();if(text)mutate(()=>api('POST','/api/comments',{studentId:t.dataset.sid,text}),'Feedback posted')}
+  else if(t.id==='login-form'){e.preventDefault();const fd=new FormData(t);try{const r=await api('POST','/api/auth/login',{email:fd.get('email'),password:fd.get('password')});await boot(r.user)}catch(err){toast(err.message,'error')}}
+  else if(t.id==='pw-form'){e.preventDefault();const fd=new FormData(t);if(fd.get('newPassword')!==fd.get('newPassword2')){toast('The two new passwords do not match.','warning');return}
+    try{await api('POST','/api/auth/change-password',{currentPassword:fd.get('currentPassword'),newPassword:fd.get('newPassword')});state.me.mustChangePassword=false;closeModal();toast('Password changed','success')}catch(err){toast(err.message,'error')}}
+});
+document.addEventListener('change',e=>{
+  const t=e.target;
+  if(t.dataset.progress){const m=D().milestones.find(x=>x.id===t.dataset.progress);if(m){const p=Number(t.value);let st=m.status;if(p===100)st='Completed';else if(st==='Completed')st='In Progress';else if(st==='Not Started'&&p>0)st='In Progress';patch('milestones',m.id,{progress:p,status:st})}}
+  else if(t.dataset.msstatus){patch('milestones',t.dataset.msstatus,t.value==='Completed'?{status:t.value,progress:100}:{status:t.value})}
+  else if(t.dataset.pubstatus){patch('publications',t.dataset.pubstatus,{status:t.value})}
+  else if(t.dataset.plan){const [lid,nid]=t.dataset.plan.split(':');const l=D().logs.find(x=>x.id===lid);if(l)patch('logs',lid,{nextPlan:(l.nextPlan||[]).map(n=>n.id===nid?{...n,done:t.checked}:n)})}
+  else if(t.id==='lit-rel'){state.litRel=t.value;renderAll()}
+  else if(t.id==='up-input'){setUpFiles([...t.files])}
+  else if(t.id==='uf-role'){document.getElementById('uf-student').classList.toggle('hidden',t.value!=='student');document.getElementById('uf-assign').classList.toggle('hidden',!['reviewer','supervisor'].includes(t.value))}
+});
+document.addEventListener('input',e=>{if(e.target.dataset.progress){e.target.nextElementSibling.textContent=e.target.value+'%'}
+  if(e.target.id==='lit-search'){state.litSearch=e.target.value;const pos=e.target.selectionStart;renderAll();const n=document.getElementById('lit-search');if(n){n.focus();n.setSelectionRange(pos,pos)}}});
+document.addEventListener('dragstart',e=>{const c=e.target.closest&&e.target.closest('[data-drag]');if(c){state.dragId=c.dataset.drag;try{e.dataTransfer.setData('text/plain',c.dataset.drag)}catch{}}});
+document.addEventListener('dragover',e=>{const z=e.target.closest&&e.target.closest('[data-drop],#up-drop');if(z){e.preventDefault();z.classList.add('drop-on')}});
+document.addEventListener('dragleave',e=>{const z=e.target.closest&&e.target.closest('[data-drop],#up-drop');if(z&&!z.contains(e.relatedTarget))z.classList.remove('drop-on')});
+document.addEventListener('drop',e=>{
+  const u=e.target.closest&&e.target.closest('#up-drop');if(u){e.preventDefault();u.classList.remove('drop-on');setUpFiles([...e.dataTransfer.files]);return}
+  const z=e.target.closest&&e.target.closest('[data-drop]');if(!z)return;e.preventDefault();
+  const ex=D().experiments.find(x=>x.id===state.dragId);state.dragId=null;
+  if(ex&&ex.status!==z.dataset.drop&&canEdit('experiments')){ex.status=z.dataset.drop;renderAll();patch('experiments',ex.id,{status:z.dataset.drop})}else renderAll();
+});
+
+async function boot(user){
+  state.booted=true;
+  try{const r=await api('GET','/api/me');state.me=r.user;state.aiEnabled=r.aiEnabled;state.maxUploadMb=r.maxUploadMb||25}
+  catch{state.me=null;renderAll();return}
+  await reload();
+  if(state.me.mustChangePassword)passwordModal(true);
+}
+boot();
+}
+
+</script>
+</body>
+</html>
